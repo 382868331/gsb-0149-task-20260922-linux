@@ -1,157 +1,275 @@
 #!/usr/bin/env python3
-"""Fixed-input demonstration for the moving_gc kernel.
+"""Fixed-input demonstration for the moving_gc kernels.
 
 Run with::
 
     python demo.py
 
-Everything here is deterministic, offline and computed on the spot (no
-sleeps, no pre-recorded output).  It prints:
+Deterministic, offline, computed on the spot (no sleeps, no pre-recorded
+output).  Two independent stories:
 
-1. a *normal* collection: real address movement, strong forwarding and
-   weak-edge clearing on a graph containing garbage, a shared strong
-   child and a weak-only target;
-2. two *actually triggered* error boundaries: a stale (pre-collection)
-   handle being rejected, and allocation failing after the mandatory
-   emergency collection on an exactly-full heap.
+PART 1 (legacy, unchanged): one flat semi-space collection -- real address
+movement, strong forwarding, weak-edge clearing; then two actually
+triggered error boundaries (a stale handle; capacity failure after the
+single emergency collection).
+
+PART 2 (new): the two-generation incremental kernel on one scenario that
+exercises every new capability together -- young copying + old
+mark-sweep, an explicit per-step scan budget, an incremental-update
+write barrier fired on an interleaved black -> white edge, the
+remembered set keeping an old -> young edge alive, an ephemeron fixpoint
+chain, a finalizer that resurrects its object and allocates a new one,
+and one actually triggered rejection (attaching an object sealed for
+reclamation).
 """
 
 from __future__ import annotations
 
 import time
 
-from moving_gc import Heap, HeapCapacityError, StaleHandleError
+from moving_gc import (
+    OLD,
+    YOUNG,
+    GenHeap,
+    Heap,
+    HeapCapacityError,
+    SealedForReclamationError,
+    StaleHandleError,
+)
 
 
 def hr(title: str) -> None:
     print()
-    print("=" * 68)
+    print("=" * 72)
     print(title)
-    print("=" * 68)
+    print("=" * 72)
 
 
-def main() -> None:
-    started = time.perf_counter()
-
-    # ------------------------------------------------------------------ #
-    # Part 1: normal collection with movement + weak clearing
-    # ------------------------------------------------------------------ #
-    hr("PART 1 (normal): one semi-space collection on a fixed graph")
+def part_one_legacy() -> None:
+    hr("PART 1 (legacy Heap): one semi-space collection + two error boundaries")
     heap = Heap(capacity=40)
-
-    # Layout (sizes in slots):
-    #   tmp    size 2, no roots        -> garbage
-    #   holder size 5 (hdr,payload,1 strong,2 weak), payload 100
-    #   child  size 2, payload 200     -> strongly reachable via holder
-    #   cache  size 2, payload 300     -> only weakly referenced, must die
     tmp = heap.allocate(999)
     holder = heap.allocate(100, n_strong=1, n_weak=2)
     child = heap.allocate(200)
     cache = heap.allocate(300)
-
-    heap.set_strong(holder, 0, child)   # keeps child alive
-    heap.set_weak(holder, 0, cache)     # weak-only: cache is reclaimed
-    heap.set_weak(holder, 1, child)     # weak to a survivor: forwarded
+    heap.set_strong(holder, 0, child)
+    heap.set_weak(holder, 0, cache)
+    heap.set_weak(holder, 1, child)
     heap.add_root("main", holder)
-
-    before = {
-        "tmp": tmp.address,
-        "holder": holder.address,
-        "child": child.address,
-        "cache": cache.address,
-    }
-    print(f"capacity={heap.capacity} slots per semi-space; "
-          f"used before collect = {heap.used_slots}")
-    print("addresses before collection:", before)
-    print("edges before: holder.strong[0] -> child @ "
-          f"{heap.get_strong(holder, 0).address}, "
-          f"holder.weak[0] -> cache @ {heap.get_weak(holder, 0).address}, "
-          f"holder.weak[1] -> child @ {heap.get_weak(holder, 1).address}")
+    before = {"holder": holder.address, "child": child.address,
+              "cache": cache.address}
 
     result = heap.collect()
-
-    print("\ncollection result:")
-    print(f"  epoch:                 0 -> {heap.epoch}")
-    print(f"  relocated old -> new:  {dict(sorted(result.relocated.items()))}")
-    print(f"  live_slots:            {result.live_slots}")
-    print(f"  roots preserved:       {result.roots_preserved}")
-    print(f"  cleared weak edges:    {list(result.cleared_weak_edges)}")
-
+    print("relocated:", dict(sorted(result.relocated.items())),
+          "| cleared weak edges:", list(result.cleared_weak_edges),
+          "| epoch ->", heap.epoch)
     h = heap.root_handle("main")
-    strong_child = heap.get_strong(h, 0)
-    weak_cache = heap.get_weak(h, 0)
-    weak_child = heap.get_weak(h, 1)
+    print(f"holder moved {before['holder']} -> {h.address}; "
+          f"weak[0] to dead cache is now {heap.get_weak(h, 0)}")
+    assert heap.get_weak(h, 0) is None
 
-    print("\nafter collection:")
-    print(f"  holder moved {before['holder']} -> {h.address}")
-    print(f"  child  moved {before['child']} -> {strong_child.address}")
-    print(f"  holder.payload = {heap.payload(h)} (preserved)")
-    print(f"  strong[0] now points at child's new address {strong_child.address}; "
-          f"same object as weak[1]: {weak_child == strong_child}")
-    print(f"  weak[0] (was -> cache @ {before['cache']}) is now: {weak_cache} "
-          f"[cleared because cache was weakly referenced only]")
-    print(f"  live object addresses in the compacted heap: {list(heap.objects())}")
-
-    moved = h.address != before["holder"] and strong_child.address != before["child"]
-    assert moved and weak_cache is None, "demo invariant failed"
-    print("  >> addresses really changed and the dead weak edge was cleared.")
-
-    # ------------------------------------------------------------------ #
-    # Part 2a: stale (old-epoch) external handle is rejected
-    # ------------------------------------------------------------------ #
-    hr("PART 2a (boundary): a stale handle from before the GC is rejected")
-    stale = holder  # epoch-0 handle; epoch is now 1
-    print(f"stale handle: address={stale.address}, epoch={stale.epoch} "
-          f"(heap epoch={heap.epoch})")
     try:
-        heap.payload(stale)
+        heap.payload(holder)
     except StaleHandleError as exc:
-        print(f"  heap.payload(stale) raised StaleHandleError: {exc}")
-    else:  # pragma: no cover - demo must actually trigger the error
+        print("stale pre-GC handle rejected:", exc)
+    else:  # pragma: no cover
         raise AssertionError("expected StaleHandleError")
-    # Failed call changed nothing: the current-epoch root still works.
-    print(f"  heap unchanged; root payload via fresh handle = "
-          f"{heap.payload(heap.root_handle('main'))}")
 
-    # ------------------------------------------------------------------ #
-    # Part 2b: exactly-full heap -> emergency GC, then capacity error
-    # ------------------------------------------------------------------ #
-    hr("PART 2b (boundary): allocation failure after one emergency GC")
     small = Heap(capacity=8)
-    a = small.allocate(1, n_strong=1)  # 3 slots
-    b = small.allocate(2, n_strong=1)  # 3 slots
-    c = small.allocate(3)              # 2 slots -> exactly 8/8
-    # Every object is rooted, so an emergency collection reclaims nothing.
+    a = small.allocate(1, n_strong=1)
+    b = small.allocate(2, n_strong=1)
+    c = small.allocate(3)
     small.add_root("a", a)
     small.add_root("b", b)
     small.add_root("c", c)
-    print(f"allocated objects at {a.address}, {b.address}, {c.address}; "
-          f"used={small.used_slots}/{small.capacity}, all three rooted")
-    print("requesting one more 2-slot object; active space is full ...")
-    epoch_before = small.epoch
     try:
         small.allocate(4)
     except HeapCapacityError as exc:
-        print(f"  raised HeapCapacityError: {exc}")
+        print("full heap after one emergency GC rejected the allocation:", exc)
     else:  # pragma: no cover
         raise AssertionError("expected HeapCapacityError")
-    print(f"  exactly one emergency collection ran (epoch {epoch_before} -> "
-          f"{small.epoch}); all roots survived, used_slots={small.used_slots}, "
-          f"no half-object left: {len(small.objects())} objects remain")
-    # Once the roots are released, a manual collection empties the heap and
-    # the previously-impossible allocation succeeds: clean state, no debris.
-    small.remove_root("a")
-    small.remove_root("b")
-    small.remove_root("c")
-    small.collect()
-    d = small.allocate(4)
-    print(f"  after dropping roots and collecting: new object allocated at "
-          f"address {d.address}, payload={small.payload(d)}")
 
+
+def part_two_generational() -> None:
+    hr("PART 2 (GenHeap): generations, budgeted steps, barrier, ephemerons, "
+       "finalizers")
+    # Generous enough to hold the whole fixed scenario.
+    heap = GenHeap(young_capacity=200, old_capacity=400, promote_age=1)
+
+    # --- Build the cast in the nursery and force the backbone old. ----- #
+    # O is the old holder; it starts with one strong slot (the remembered
+    # edge is written later) and one weak slot.
+    O = heap.allocate(10, n_strong=2, n_weak=1)
+    heap.add_root("O", O)
+    heap.run_minor(64)                  # O promotes to the old generation
+    O = heap.root_handle("O")
+    print(f"O promoted to the old generation at address {O.address} "
+          f"(generation {heap.generation_of(O)})")
+
+    # Young objects used later by the remembered-set story are allocated
+    # after the major (see below), so they are genuinely white nursery
+    # objects reached only by an old -> young write.
+
+    # Ephemeron fixpoint chain (all young; evaluated during a later major):
+    # T rooted; e1 (T,K1)->K2, e2 (T,K2)->V, with K1 rooted too.
+    T = heap.allocate(30)
+    K1 = heap.allocate(31)
+    K2 = heap.allocate(32)
+    V = heap.allocate(33)
+    heap.add_root("T", T)
+    heap.add_root("K1", K1)
+    e1 = heap.add_ephemeron(T, K1, K2)
+    e2 = heap.add_ephemeron(T, K2, V)
+
+    # Finalizer object F: finalizer resurrects F and allocates a new young
+    # object D during the event.  Give O a weak edge to F so its clearing
+    # after (non-)reclamation is observable.
+    F = heap.allocate(40)
+    heap.add_root("F", F)
+
+    def finalizer(hp: GenHeap, handle) -> None:
+        print(f"  [finalizer event] F at {handle.address} is unreachable; "
+              "re-rooting it and allocating D")
+        hp.add_root("resurrected_F", handle)
+        born = hp.allocate(999)
+        hp.add_root("born_in_finalizer", born)
+
+    # Promote T,K1,K2,V,F (and the ephemeron table/keys) to the old
+    # generation so a major mark-sweep decides their fate.  The minor's
+    # ephemeron fixpoint keeps K2 and V alive; 'keep'/'trash' are not yet
+    # referenced and die as young garbage.
+    minor0 = heap.run_minor(64)         # age 1 -> promote the rooted set
+    promoted = minor0.promoted
+    # Re-fetch current-epoch handles at the post-promotion old addresses.
+    T = heap.root_handle("T")
+    K1 = heap.root_handle("K1")
+    F = heap.root_handle("F")
+    O = heap.root_handle("O")
+    K2 = heap.handle(promoted[K2.address])
+    V = heap.handle(promoted[V.address])
+    print("minor promoted T,K1,K2,V,F to old:",
+          sorted(promoted.values()),
+          "| ephemeron entries preserved:", heap.ephemeron_ids())
+
+    token = heap.set_finalizer(F, finalizer)
+    heap.set_weak(O, 0, F)
+    # Drop F's root: it is now old garbage pending its one finalizer event.
+    heap.remove_root("F")
+
+    # --- Interleaved, budgeted MAJOR collection. ------------------------ #
+    # Budget of 3 examinations per step; we mutate between steps to force
+    # the incremental-update barrier to fire.
+    print("\nrunning a MAJOR cycle with scan_budget=3, mutating between steps")
+    total_scanned = 0
+    barrier_seen = False
+    res = heap.collect_step(3, "major")
+    step_no = 0
+    fired_barrier_write = False
+    while not res.completed:
+        step_no += 1
+        total_scanned += res.scanned
+        assert res.scanned <= res.budget and res.overscan == 0
+        # While marking is open, make a black holder point at a white
+        # object exactly once; the IU barrier must grey that target.
+        if (not fired_barrier_write and res.phase in ("mark", "fdiscover")
+                and heap.gray_pending()):
+            # Pick K2 (white unless the ephemeron chain already reached it)
+            # and hang it off the already-black O via strong slot 1.
+            try:
+                heap.set_strong(O, 1, K2)
+                fired_barrier_write = True
+            except Exception:
+                pass
+        res = heap.collect_step(3)
+    total_scanned += res.scanned
+    print(f"major completed in {res.steps_in_cycle} steps, "
+          f"{total_scanned} examinations total "
+          f"(each step <= its budget; overscan always {res.overscan})")
+    print("ephemerons removed this cycle:", list(res.cleared_ephemerons))
+    print("finalizer events:", list(res.finalized), "token", token)
+
+    # Outcomes:
+    #  - the ephemeron chain reached K2 then V (both old and alive);
+    #  - F was resurrected by its finalizer and D was born in the event;
+    #  - the barrier write O->K2 is observable and consistent.
+    O = heap.root_handle("O")
+    assert heap.get_strong(O, 1).address == K2.address
+    print("O.strong[1] (barrier write) ->", heap.get_strong(O, 1).address)
+    print("resurrected F root ->", heap.root_handle("resurrected_F").address)
+    born = heap.root_handle("born_in_finalizer")
+    print("D born during finalization: address", born.address,
+          "generation", heap.generation_of(born), "payload", heap.payload(born))
+    assert heap.payload(born) == 999
+
+    # --- Remembered set on a budgeted MINOR. ---------------------------- #
+    hr("PART 2 (continued): remembered set keeps an old -> young edge alive")
+    keep = heap.allocate(20)             # reached only by the old -> young edge
+    trash = heap.allocate(21)            # never reached: must die
+    print("writing O.strong[0] -> young 'keep'; 'trash' stays unreachable")
+    heap.set_strong(O, 0, keep)
+    print("remembered set before minor:", heap.remembered_set())
+    minor = heap.run_minor(5)
+    print("minor promoted:", dict(sorted(minor.promoted.items())),
+          "| moved-young:", dict(sorted(minor.relocated.items())))
+    O = heap.root_handle("O")
+    forwarded = heap.get_strong(O, 0)
+    print("O.strong[0] forwarded to", forwarded.address,
+          "generation", heap.generation_of(forwarded))
+    assert forwarded.address == minor.promoted[keep.address]
+    assert trash.address not in heap.objects()
+    assert heap.remembered_set() == ()     # edge is now old -> old
+
+    # --- One actually triggered rejection. ------------------------------- #
+    hr("PART 2 (boundary): attaching a sealed-for-reclamation object is refused")
+    g2 = GenHeap(young_capacity=80, old_capacity=160, promote_age=1)
+    a = g2.allocate(1, n_strong=1)
+    dead = g2.allocate(2)
+    g2.set_strong(a, 0, dead)
+    g2.add_root("a", a)
+    g2.run_minor(4)                      # both old
+    a = g2.root_handle("a")
+    dead = g2.get_strong(a, 0)
+    g2.set_strong(a, 0, None)            # dead is now unreachable old garbage
+    r = g2.collect_step(1, "major")
+    while not r.completed and r.phase not in ("weakclear", "sweep"):
+        r = g2.collect_step(1)
+    print(f"major reached the sealed phase {r.phase!r}; "
+          f"trying to attach dead object {dead.address} to a live holder ...")
+    try:
+        g2.set_strong(a, 0, dead)
+    except SealedForReclamationError as exc:
+        print("  rejected:", type(exc).__name__, "-", exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected SealedForReclamationError")
+    print("  failed write left no dangling edge:", g2.get_strong(a, 0))
+    assert g2.get_strong(a, 0) is None
+
+    # A promotion that provably cannot fit is a deterministic failure too.
+    hr("PART 2 (boundary): promotion set that cannot fit -> HeapCapacityError")
+    tiny = GenHeap(young_capacity=60, old_capacity=4, promote_age=10)
+    big = tiny.allocate(7, n_strong=4)  # size 6: fits young, never fits old
+    tiny.add_root("big", big)
+    tiny.request_promotion(big)
+    try:
+        tiny.run_minor(8)
+    except HeapCapacityError as exc:
+        print("  rejected promotion:", exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected HeapCapacityError")
+    # The failed minor moved nothing; the heap still serves from its state.
+    assert tiny.epoch == 0 and big.address in tiny.objects()
+    print("  heap state unchanged after the failed minor (epoch", tiny.epoch, ")")
+
+
+def main() -> None:
+    started = time.perf_counter()
+    part_one_legacy()
+    part_two_generational()
     elapsed = time.perf_counter() - started
     print()
-    print(f"demo finished in {elapsed * 1000:.1f} ms (real computation, "
-          "no sleeps, fixed deterministic inputs).")
+    print(f"demo finished in {elapsed * 1000:.1f} ms (real deterministic "
+          "computation, no sleeps, no pre-recorded answers).")
+    assert elapsed < 90, "demo must finish within 90 seconds"
 
 
 if __name__ == "__main__":

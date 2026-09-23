@@ -27,3 +27,27 @@ class HeapCapacityError(GCError):
     caller's behalf; the surviving working set genuinely does not fit,
     or the single object is larger than the semi-space capacity.
     """
+
+
+class CollectionInProgressError(GCError):
+    """A collection cycle of a different kind was requested mid-cycle.
+
+    Incremental collection cycles are resumed with the same ``kind`` they
+    were started with (or with ``kind`` omitted).  Starting a minor cycle
+    while a major cycle is suspended, or vice versa, is rejected; the
+    in-progress cycle is left untouched.
+    """
+
+
+class FinalizerError(GCError):
+    """A finalizer-registration precondition was violated."""
+
+
+class SealedForReclamationError(GCError):
+    """A mutation named an object whose reclamation is already sealed.
+
+    Raised during the closed phases of a major collection (weak clearing /
+    sweeping): the target old object was unreachable at the finalization
+    fixpoint, was not resurrected, and cannot be attached to anything
+    anymore.
+    """
