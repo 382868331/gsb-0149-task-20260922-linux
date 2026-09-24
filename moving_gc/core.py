@@ -80,14 +80,18 @@ class Handle:
     """Opaque external reference to one heap object.
 
     ``address`` is the 0-based slot index of the object header in the
-    semi-space that was active when the handle was minted.  ``epoch`` is
-    the heap epoch at mint time.  Handles are intentionally immutable;
-    obtain fresh handles (e.g. via :meth:`Heap.handle`) after every
-    collection rather than mutating stale ones.
+    space/generation that was active when the handle was minted.
+    ``epoch`` is the heap epoch at mint time; ``generation`` names the
+    object's generation for generational heaps (``OLD=0`` / ``YOUNG=1``
+    from :mod:`moving_gc.gen`); it defaults to ``-1`` for legacy v1
+    semi-space handles, which never inspect it.  Handles are intentionally
+    immutable; obtain fresh handles (e.g. via :meth:`Heap.handle`) after
+    every collection rather than mutating stale ones.
     """
 
     address: int
     epoch: int
+    generation: int = -1
 
 
 @dataclass(frozen=True)
