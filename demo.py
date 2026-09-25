@@ -11,7 +11,11 @@ sleeps, no pre-recorded output).  It prints:
 1. a *normal* collection: real address movement, strong forwarding and
    weak-edge clearing on a graph containing garbage, a shared strong
    child and a weak-only target;
-2. two *actually triggered* error boundaries: a stale (pre-collection)
+2. the **weak-key association** contract: a two-level activation chain
+   (one pass would not suffice), a key/value ring with no external root
+   that cannot bootstrap itself into liveness, and forwarding of the
+   surviving entries after relocation;
+3. two *actually triggered* error boundaries: a stale (pre-collection)
    handle being rejected, and allocation failing after the mandatory
    emergency collection on an exactly-full heap.
 """
@@ -97,9 +101,93 @@ def main() -> None:
     print("  >> addresses really changed and the dead weak edge was cleared.")
 
     # ------------------------------------------------------------------ #
-    # Part 2a: stale (old-epoch) external handle is rejected
+    # Part 2: weak-key associations (conditional strong-ness + fixpoint)
     # ------------------------------------------------------------------ #
-    hr("PART 2a (boundary): a stale handle from before the GC is rejected")
+    hr("PART 2 (weak-key associations): liveness needs table AND key")
+    wk = Heap(capacity=48)
+
+    # Unrooted garbage occupying slot 0 so the first collection really
+    # relocates every survivor (like Part 1).
+    wk.allocate(999)
+
+    # A single table object and two keys/values arranged as a two-level
+    # activation chain:
+    #   table[k1] = v1 ; v1 strongly references k2 ; table[k2] = v2
+    # Roots are only: table and k1.  Nothing else roots k2 or v2.
+    table = wk.allocate(10)
+    k1 = wk.allocate(11)
+    v1 = wk.allocate(21, n_strong=1)   # v1 -> k2
+    k2 = wk.allocate(12)
+    v2 = wk.allocate(22)
+    wk.set_strong(v1, 0, k2)
+    wk.association_put(table, k1, v1)
+    wk.association_put(table, k2, v2)
+    wk.add_root("table", table)
+    wk.add_root("k1", k1)
+
+    pre = {"table": table.address, "k1": k1.address, "v1": v1.address,
+           "k2": k2.address, "v2": v2.address}
+    print("roots: only table and k1; entries table[k1]=v1, table[k2]=v2;")
+    print("v1 strongly references k2 (which has no root).")
+    print("addresses before:", pre)
+
+    cres = wk.collect()
+    t2 = wk.root_handle("table")
+    k1b = wk.root_handle("k1")
+    v1b = wk.association_get(t2, k1b)
+    print("\ncollection result:")
+    print(f"  relocated old -> new: {dict(sorted(cres.relocated.items()))}")
+    print(f"  surviving associations (new table,key,value addresses): "
+          f"{list(cres.surviving_associations)}")
+    print(f"  cleared associations: {list(cres.cleared_associations)}")
+    print("  pass 1 activates table[k1]=v1 (k1 already alive); v1 then")
+    print("  strongly reaches k2; pass 2 activates table[k2]=v2.")
+    # Recover k2/v2 post-GC handles by walking from v1's strong edge.
+    k2b = wk.get_strong(v1b, 0)
+    v2b = wk.association_get(t2, k2b)
+    print(f"  after GC: table@{t2.address}, k1@{k1b.address}, v1@{v1b.address}, "
+          f"k2@{k2b.address}, v2@{v2b.address}")
+    assert {t2.address, k1b.address, v1b.address, k2b.address, v2b.address} == \
+        set(cres.relocated.values()), "all five must survive the two-level chain"
+    assert len(cres.surviving_associations) == 2
+
+    # A key/value ring with no external key root must NOT bootstrap:
+    # table2[k3]=v3, v3 strongly -> k3, but only table2 is rooted.
+    table2 = wk.allocate(30)
+    k3 = wk.allocate(31)
+    v3 = wk.allocate(32, n_strong=1)
+    wk.set_strong(v3, 0, k3)
+    wk.association_put(table2, k3, v3)
+    wk.add_root("table2", table2)
+    print("\nring probe: table2[k3]=v3 and v3 -> k3, but only table2 is rooted")
+    print(f"  pre-GC addresses: table2={table2.address}, k3={k3.address}, "
+          f"v3={v3.address}")
+    ring = wk.collect()
+    t2b = wk.root_handle("table2")
+    print(f"  after GC: surviving objects = {list(wk.objects())}")
+    print(f"  cleared associations (pre-GC table,key addresses): "
+          f"{list(ring.cleared_associations)}")
+    assert k3.address not in ring.relocated and v3.address not in ring.relocated, \
+        "unrooted key/value ring must die"
+    assert ring.cleared_associations == (
+        (table2.address, k3.address),
+    ), "dead-key entry reported in pre-collection addresses"
+    print("  >> k3 and v3 were reclaimed: an entry cannot keep its own key "
+          "alive through its not-yet-copied value.")
+
+    # A second collection forwards the surviving entries from the chain.
+    fwd2 = wk.collect()
+    t3 = wk.root_handle("table")
+    k1c = wk.root_handle("k1")
+    v1c = wk.association_get(t3, k1c)
+    print("\na further collection forwards the live entries again:")
+    print(f"  table now @{t3.address}, k1 @{k1c.address}, "
+          f"table[k1] -> @{v1c.address}; live slots = {fwd2.live_slots}")
+
+    # ------------------------------------------------------------------ #
+    # Part 3a: stale (old-epoch) external handle is rejected
+    # ------------------------------------------------------------------ #
+    hr("PART 3a (boundary): a stale handle from before the GC is rejected")
     stale = holder  # epoch-0 handle; epoch is now 1
     print(f"stale handle: address={stale.address}, epoch={stale.epoch} "
           f"(heap epoch={heap.epoch})")
@@ -114,9 +202,9 @@ def main() -> None:
           f"{heap.payload(heap.root_handle('main'))}")
 
     # ------------------------------------------------------------------ #
-    # Part 2b: exactly-full heap -> emergency GC, then capacity error
+    # Part 3b: exactly-full heap -> emergency GC, then capacity error
     # ------------------------------------------------------------------ #
-    hr("PART 2b (boundary): allocation failure after one emergency GC")
+    hr("PART 3b (boundary): allocation failure after one emergency GC")
     small = Heap(capacity=8)
     a = small.allocate(1, n_strong=1)  # 3 slots
     b = small.allocate(2, n_strong=1)  # 3 slots

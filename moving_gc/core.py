@@ -23,8 +23,20 @@ Collection order
 -----------------
 Copy order is fully deterministic: roots in the order they were registered,
 each root's object copied immediately, then strong edges are processed in
-field order by a Cheney scan.  Weak edges never keep a target alive.  After
-the strong closure is evacuated, weak edges are rewritten: surviving
+field order by a Cheney scan.  Weak edges never keep a target alive.
+
+Weak-key associations are a third edge discipline, kept in side metadata
+rather than in object slots (so a table does *not* strongly reference its
+keys or values).  An association ``table[key] = value`` makes ``value``
+strong only while **both** the table object and ``key`` are independently
+alive.  After the ordinary strong closure is evacuated, the collector runs
+a fixpoint over the surviving tables: each pass activates (copies) the
+values of entries whose key has already survived, then drains the Cheney
+scan so values can strongly reach yet more keys; passes repeat until no new
+entry activates.  Entries of dead tables and entries whose key never
+becomes alive are deleted; surviving entries are forwarded.  A key kept
+reachable only by a value that its own entry would activate can never
+bootstrap itself.  Finally the plain weak edges are rewritten: surviving
 targets point at the new address, dead targets are cleared to ``None``.
 
 The module only implements the finite contract described in README.md; it
@@ -105,12 +117,25 @@ class CollectionResult:
             target was unreachable and were set to ``None``.
         roots_preserved: number of registered roots that were non-null and
             updated to point at their object's copy.
+        surviving_associations: ``(table_address, key_address,
+            value_address)`` triples, using *post-collection* addresses, for
+            weak-key entries that stayed live (table and key independently
+            alive, value evacuated); ordered by (table, key) address.
+        cleared_associations: ``(table_address, key_address)`` pairs, using
+            *pre-collection* addresses (a cleared key has no post-collection
+            address, so each pair stays in one address namespace; translate
+            the table via ``relocated``), for entries deleted because their
+            key was not alive.  Entries of a dead table vanish with the
+            table and are not reported here; ordered like
+            ``surviving_associations``.
     """
 
     relocated: dict[int, int]
     live_slots: int
     cleared_weak_edges: tuple[tuple[int, int], ...] = field(default_factory=tuple)
     roots_preserved: int = 0
+    surviving_associations: tuple[tuple[int, int, int], ...] = field(default_factory=tuple)
+    cleared_associations: tuple[tuple[int, int], ...] = field(default_factory=tuple)
 
 
 class Heap:
@@ -146,6 +171,12 @@ class Heap:
         self._roots: dict[str, int | None] = {}
         # Root insertion order (Python dict preserves it, but be explicit).
         self._root_order: list[str] = []
+        # Weak-key associations in side metadata (NOT object slots, so they
+        # are neither strong nor weak edges): table address ->
+        # {key address: value address}.  An entry keeps its value alive
+        # during a collection iff its table *and* key are independently
+        # alive; see the fixpoint activation in collect().
+        self._associations: dict[int, dict[int, int]] = {}
 
     # ------------------------------------------------------------------ #
     # Introspection
@@ -370,16 +401,98 @@ class Heap:
         return self._layout[self._resolve(target)]
 
     # ------------------------------------------------------------------ #
+    # Weak-key associations (side metadata, never a slot edge)
+    # ------------------------------------------------------------------ #
+    def association_put(
+        self, table: Handle, key: Handle, value: Handle | None
+    ) -> None:
+        """Insert, replace or delete one weak-key association.
+
+        The association lives in side metadata on the *table* object; it is
+        not an object slot, so the table neither strongly nor weakly
+        references ``key``/``value``.  During a collection the entry keeps
+        ``value`` alive only while **both** ``table`` and ``key`` are
+        independently alive (see :meth:`collect`).
+
+        Passing ``value=None`` deletes the entry for ``key``.  All three
+        handles are validated before any mutation, so a stale handle never
+        creates a half entry or removes an existing one.  ``key`` must be
+        non-null (unlike ordinary edges, associations have no null key);
+        ``None`` is accepted for ``value`` only as the explicit deletion
+        marker above.
+        """
+        table_addr = self._resolve(table)
+        key_addr = self._resolve(key)
+        value_addr = None if value is None else self._resolve(value)
+        table_entries = self._associations.setdefault(table_addr, {})
+        if value_addr is None:
+            table_entries.pop(key_addr, None)
+        else:
+            table_entries[key_addr] = value_addr
+
+    def association_get(self, table: Handle, key: Handle) -> Handle | None:
+        """Return the current value handle for ``table[key]``, else ``None``.
+
+        ``None`` means no live entry for that key: either it was never
+        inserted, it was explicitly deleted, or a previous collection
+        removed it because the table or its key died.  This is an explicit
+        metadata lookup, not a weak edge; a stale *handle* passed in as an
+        argument is still rejected.
+        """
+        table_addr = self._resolve(table)
+        key_addr = self._resolve(key)
+        value_addr = self._associations.get(table_addr, {}).get(key_addr)
+        if value_addr is None:
+            return None
+        return Handle(value_addr, self._epoch)
+
+    def association_remove(self, table: Handle, key: Handle) -> None:
+        """Delete ``table[key]`` if present; absent keys are a no-op."""
+        table_addr = self._resolve(table)
+        key_addr = self._resolve(key)
+        table_entries = self._associations.get(table_addr)
+        if table_entries is not None:
+            table_entries.pop(key_addr, None)
+
+    def association_entries(self, table: Handle) -> tuple[tuple[Handle, Handle], ...]:
+        """Snapshot ``((key_handle, value_handle), ...)`` for a live table.
+
+        Ordered by current key address.  Only currently live entries are
+        listed; a collection has already removed entries whose table or key
+        died.  The returned handles are fresh for the current epoch.
+        """
+        table_addr = self._resolve(table)
+        table_entries = self._associations.get(table_addr, {})
+        return tuple(
+            (Handle(key_addr, self._epoch), Handle(value_addr, self._epoch))
+            for key_addr, value_addr in sorted(table_entries.items())
+        )
+
+    # ------------------------------------------------------------------ #
     # Collection
     # ------------------------------------------------------------------ #
     def collect(self) -> CollectionResult:
         """Run one stop-the-world semi-space collection.
 
-        Reachability is computed solely from registered roots through
-        strong edges.  Surviving objects are copied into the inactive
-        semi-space in root order / strong-field order (Cheney scanning).
-        Roots, strong edges and the weak edges that name survivors are
-        forwarded; weak edges naming dead objects are cleared.
+        Reachability is computed in two levels from registered roots.
+        **Level 1** is the ordinary strong closure: roots are evacuated in
+        registration order and strong edges are copied by a Cheney scan in
+        field order.  **Level 2** is the weak-key association fixpoint:
+        only entries of tables that survived level 1 participate; repeated
+        passes activate entries whose key has already been evacuated,
+        copying their values as additional strong roots and draining the
+        Cheney queue after each activation, until a pass adds nothing.
+        Thus a value can make another entry's key alive (the reason one
+        pass is insufficient), but a key reachable only through its own
+        entry's not-yet-copied value never activates -- the activation test
+        precedes the value copy, so the least fixpoint excludes bootstrap
+        cycles.
+
+        Surviving objects are copied into the inactive semi-space.  Roots,
+        strong edges, surviving weak-key associations and the weak edges
+        that name survivors are forwarded; weak edges naming dead objects
+        are cleared, and associations of dead tables or with dead keys are
+        deleted.
 
         On success the heap flips semi-spaces and its epoch advances by
         one.  The operation is all-or-nothing: if the live set does not
@@ -445,11 +558,96 @@ class Heap:
                         dst[strong_base + j] = copy_obj(old_target)
                 scan = new + _HEADER + _PAYLOAD + n_strong + n_weak
 
+            # Phase 3: weak-key association activation, iterated to a least
+            # fixpoint.  A table participates iff it has evacuated by the
+            # time a pass starts -- this includes tables that an earlier
+            # pass's activated value dragged in, not just level-1 tables; a
+            # table that never survives has no participating entries and
+            # its metadata vanishes unexamined in phase 4.  In each pass
+            # every participating table is visited in evacuation order
+            # (destination address ascending) and its entries in key-address
+            # order.  An entry whose key is *already* evacuated activates:
+            # its value is copied (treated as one strong root for this GC)
+            # and the Cheney queue is drained immediately, so a freshly
+            # copied value can strongly reach keys -- and further tables --
+            # that later passes activate.  Passes repeat until a pass
+            # activates no new entry.  Because the liveness test reads fwd
+            # membership *before* the entry's own value is copied, a key
+            # reachable only from that value can never bootstrap itself
+            # into liveness.
+            old_associations = self._associations
+            activated: set[tuple[int, int]] = set()
+
+            def drain_cheney() -> None:
+                nonlocal scan
+                while scan < free:
+                    cur = scan
+                    n_strong, n_weak = new_layout[cur]
+                    strong_base = cur + 2
+                    for j in range(n_strong):
+                        old_target = dst[strong_base + j]
+                        if old_target is not None:
+                            dst[strong_base + j] = copy_obj(old_target)
+                    scan = cur + _HEADER + _PAYLOAD + n_strong + n_weak
+
+            while True:
+                # Recomputed every pass: fwd (and thus the new addresses) is
+                # fixed for already-copied tables, and activated tables are
+                # appended at their bump addresses, so the order stays total
+                # and deterministic.
+                table_order = sorted(
+                    (tbl for tbl in old_associations if tbl in fwd),
+                    key=lambda tbl: fwd[tbl],
+                )
+                progressed = False
+                for tbl_old in table_order:
+                    for key_old, value_old in sorted(old_associations[tbl_old].items()):
+                        entry = (tbl_old, key_old)
+                        if entry in activated:
+                            continue
+                        if key_old in fwd:
+                            copy_obj(value_old)
+                            activated.add(entry)
+                            progressed = True
+                            drain_cheney()
+                if not progressed:
+                    break
+
             live_slots = free
 
-            # Phase 3: fix weak edges of survivors.  Weak targets never became
-            # part of the closure, so they are either in fwd (alive elsewhere)
-            # or unreachable -> clear.
+            # Phase 4: rebuild association metadata against forwarded
+            # addresses.  Entries of live tables whose key died are deleted
+            # and reported; entries of dead tables disappear with the table
+            # and are not part of the report.
+            new_associations: dict[int, dict[int, int]] = {}
+            surviving_entries: list[tuple[int, int, int]] = []
+            cleared_entries: list[tuple[int, int]] = []
+            for tbl_old in sorted(old_associations):
+                if tbl_old not in fwd:
+                    continue
+                tbl_new = fwd[tbl_old]
+                new_map: dict[int, int] = {}
+                for key_old, value_old in old_associations[tbl_old].items():
+                    if key_old in fwd:
+                        # Activation guarantees the value was evacuated too.
+                        new_map[fwd[key_old]] = fwd[value_old]
+                        surviving_entries.append(
+                            (tbl_new, fwd[key_old], fwd[value_old])
+                        )
+                    else:
+                        # Pre-collection addresses for both: a dead key has
+                        # no forwarded address, so the pair stays in one
+                        # address namespace (translate table via fwd/relocated).
+                        cleared_entries.append((tbl_old, key_old))
+                if new_map:
+                    new_associations[tbl_new] = new_map
+            surviving_entries.sort()
+            cleared_entries.sort()
+
+            # Phase 5: fix plain weak edges of survivors.  Weak targets never
+            # became part of either closure, so they are either in fwd (alive
+            # elsewhere, including via an activated association value) or
+            # unreachable -> clear.
             cleared: list[tuple[int, int]] = []
             for new in sorted(new_layout):
                 n_strong, n_weak = new_layout[new]
@@ -480,6 +678,7 @@ class Heap:
         self._alloc_ptr = live_slots
         self._layout = new_layout
         self._roots = new_roots
+        self._associations = new_associations
         self._epoch += 1
 
         return CollectionResult(
@@ -487,6 +686,8 @@ class Heap:
             live_slots=live_slots,
             cleared_weak_edges=tuple(cleared),
             roots_preserved=roots_preserved,
+            surviving_associations=tuple(surviving_entries),
+            cleared_associations=tuple(cleared_entries),
         )
 
     # ------------------------------------------------------------------ #
