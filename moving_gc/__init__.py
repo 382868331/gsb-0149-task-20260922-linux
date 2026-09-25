@@ -1,4 +1,6 @@
-"""moving_gc: a self-contained semi-space moving GC kernel with weak edges.
+"""moving_gc: a self-contained semi-space moving GC kernel.
+
+Supports strong edges, weak edges and weak-key (ephemeron-like) entries.
 
 Public surface::
 

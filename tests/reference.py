@@ -3,16 +3,25 @@
 This module deliberately does **not** import :mod:`moving_gc`.  It models
 the same abstract machine on its own terms -- named objects stored in
 plain dictionaries, reachability computed by an independent BFS over
-strong edges, and the expected Cheney evacuation simulated with an
-explicit queue.  Tests build a graph once as a :class:`GraphSpec`, feed an
-equivalent heap through the public Heap API, and assert that the heap's
-behaviour matches the oracle's predictions.
+strong edges plus a least-fixpoint over weak-key entries, and the expected
+Cheney evacuation simulated with an explicit queue.  Tests build a graph
+once as a :class:`GraphSpec`, feed an equivalent heap through the public
+Heap API, and assert that the heap's behaviour matches the oracle's
+predictions.
 
 Address convention (mirrors the heap contract):
-* objects occupy ``2 + n_strong + n_weak`` consecutive slots;
+* objects occupy ``2 + n_strong + n_weak + 2*n_entries`` consecutive slots;
 * a node's address is the slot index of its header;
 * both worlds allocate in ``GraphSpec.add_node`` call order, so the test
   harness can reproduce identical pre-collection addresses.
+
+Weak-key entry semantics (mirrors the heap contract):
+* an entry ``(key, value)`` of a *live* table activates iff its key is
+  already live; activation makes the value strongly reachable;
+* activation is iterated to a fixpoint (values can keep other keys, and
+  other tables' values, alive);
+* a key referenced only by its own entry's value never becomes live;
+* entries whose key stayed dead are deleted (both slots cleared).
 """
 
 from __future__ import annotations
@@ -26,6 +35,8 @@ class _Node:
     payload: int
     strong: list[str | None]
     weak: list[str | None]
+    # (key, value) node-name pairs; key None means a vacant entry.
+    entries: list[tuple[str | None, str | None]]
     address: int  # address in the current semi-space
 
 
@@ -39,6 +50,8 @@ class ExpectedCollection:
     live_slots: int
     # (holder node name, weak field index) in deterministic holder/field order
     cleared: tuple[tuple[str, int], ...]
+    # (table node name, entry index) in deterministic table/entry order
+    cleared_entries: tuple[tuple[str, int], ...]
     # root name -> survivor node name (or None for a null root)
     roots: dict[str, str | None]
     # copy order (node names), i.e. destination-address ascending order
@@ -65,10 +78,11 @@ class GraphSpec:
         payload: int = 0,
         n_strong: int = 0,
         n_weak: int = 0,
+        n_entries: int = 0,
     ) -> int:
         if name in self.nodes:
             raise ValueError(f"duplicate node {name!r}")
-        size = 2 + n_strong + n_weak
+        size = 2 + n_strong + n_weak + 2 * n_entries
         if self._alloc + size > self.capacity:
             raise RuntimeError("reference graph allocation overflows its declared capacity")
         addr = self._alloc
@@ -78,6 +92,7 @@ class GraphSpec:
             payload=payload,
             strong=[None] * n_strong,
             weak=[None] * n_weak,
+            entries=[(None, None)] * n_entries,
             address=addr,
         )
         return addr
@@ -87,6 +102,13 @@ class GraphSpec:
 
     def link_weak(self, src: str, index: int, dst: str | None) -> None:
         self.nodes[src].weak[index] = dst
+
+    def link_entry(
+        self, src: str, index: int, key: str | None, value: str | None = None
+    ) -> None:
+        if key is None and value is not None:
+            raise ValueError("reference: entry with a null key cannot hold a value")
+        self.nodes[src].entries[index] = (key, value)
 
     def add_root(self, root_name: str, target: str | None) -> None:
         if root_name not in self.roots:
@@ -98,34 +120,49 @@ class GraphSpec:
         self.root_order.remove(root_name)
 
     # -------------------------------------------------------------- #
-    # Independent reachability (strong edges only)
+    # Independent reachability (strong edges + entry fixpoint)
     # -------------------------------------------------------------- #
     def reachable(self) -> frozenset[str]:
-        """Strongly reachable node names from the registered roots."""
-        seen: set[str] = set()
+        """Live node names: strong closure from roots, then the least
+        fixpoint of weak-key entry activation, computed directly on the
+        named-object graph."""
+        live: set[str] = set()
         queue: list[str] = []
         for rn in self.root_order:
             t = self.roots[rn]
-            if t is not None and t not in seen:
-                seen.add(t)
+            if t is not None and t not in live:
+                live.add(t)
                 queue.append(t)
+        activated: set[tuple[str, int]] = set()
         head = 0
-        while head < len(queue):
-            cur = queue[head]
-            head += 1
-            for t in self.nodes[cur].strong:
-                if t is not None and t not in seen:
-                    seen.add(t)
-                    queue.append(t)
-        return frozenset(seen)
+        while True:
+            while head < len(queue):
+                cur = queue[head]
+                head += 1
+                for t in self.nodes[cur].strong:
+                    if t is not None and t not in live:
+                        live.add(t)
+                        queue.append(t)
+            progress = False
+            for name in list(live):
+                for i, (k, v) in enumerate(self.nodes[name].entries):
+                    if (name, i) in activated or k is None:
+                        continue
+                    if k in live:
+                        activated.add((name, i))
+                        if v is not None and v not in live:
+                            live.add(v)
+                            queue.append(v)
+                            progress = True
+            if not progress and head >= len(queue):
+                break
+        return frozenset(live)
 
     # -------------------------------------------------------------- #
     # Expected collection
     # -------------------------------------------------------------- #
     def expected_collect(self) -> ExpectedCollection:
         """Simulate one collection purely from the graph description."""
-        survivors = self.reachable()
-
         fwd: dict[str, int] = {}
         old_addr = {name: node.address for name, node in self.nodes.items()}
         copy_order: list[str] = []
@@ -134,7 +171,7 @@ class GraphSpec:
 
         def size(name: str) -> int:
             n = self.nodes[name]
-            return 2 + len(n.strong) + len(n.weak)
+            return 2 + len(n.strong) + len(n.weak) + 2 * len(n.entries)
 
         def evacuate(name: str) -> int:
             nonlocal free
@@ -160,12 +197,50 @@ class GraphSpec:
 
         # Independent Cheney scan in field order.
         head = 0
-        while head < len(queue):
-            cur = queue[head]
-            head += 1
-            for t in self.nodes[cur].strong:
-                if t is not None:
-                    evacuate(t)
+
+        def drain_strong() -> None:
+            nonlocal head
+            while head < len(queue):
+                cur = queue[head]
+                head += 1
+                for t in self.nodes[cur].strong:
+                    if t is not None:
+                        evacuate(t)
+
+        drain_strong()
+
+        # Entry fixpoint: iterate live tables in copy order (copy_order
+        # grows during the pass, exactly like the heap's live_tables list);
+        # an entry activates iff its key is already evacuated.  Activated
+        # values are evacuated and their strong fields drained before the
+        # next pass, until nothing new activates.
+        activated: set[tuple[str, int]] = set()
+        while True:
+            progress = False
+            for name in copy_order:
+                node = self.nodes[name]
+                for i, (k, v) in enumerate(node.entries):
+                    if (name, i) in activated:
+                        continue
+                    if k is None:
+                        activated.add((name, i))
+                        continue
+                    if k in fwd:
+                        if v is not None:
+                            evacuate(v)
+                        activated.add((name, i))
+                        progress = True
+            drain_strong()
+            if not progress:
+                break
+
+        # Dead-key entries of live tables are deleted, in table/entry order.
+        cleared_entries: list[tuple[str, int]] = []
+        for name in copy_order:
+            node = self.nodes[name]
+            for i, (k, _v) in enumerate(node.entries):
+                if (name, i) not in activated and k is not None:
+                    cleared_entries.append((name, i))
 
         # Weak fix-up: survivors in copy (== destination address) order.
         cleared: list[tuple[str, int]] = []
@@ -182,12 +257,17 @@ class GraphSpec:
 
         # Commit the oracle's own view of the world so it can be collected
         # again: dead nodes disappear, survivors take their new addresses,
-        # and weak edges that named dead targets are physically cleared
-        # (strong edges only ever name survivors by construction).
+        # weak edges that named dead targets are physically cleared, and
+        # non-activated entries are physically deleted (strong edges only
+        # ever name survivors by construction).
         for name in copy_order:
             self.nodes[name].address = fwd[name]
             node = self.nodes[name]
             node.weak = [t if (t is None or t in fwd) else None for t in node.weak]
+            node.entries = [
+                (k, v) if (name, i) in activated else (None, None)
+                for i, (k, v) in enumerate(node.entries)
+            ]
         for dead in [n for n in self.nodes if n not in fwd]:
             del self.nodes[dead]
         self._alloc = free
@@ -198,6 +278,7 @@ class GraphSpec:
             relocated=relocated,
             live_slots=free,
             cleared=tuple(cleared),
+            cleared_entries=tuple(cleared_entries),
             roots=dict(expected_roots),
             copy_order=tuple(copy_order),
         )

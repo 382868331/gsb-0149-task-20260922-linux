@@ -5,10 +5,12 @@ Model
 * Two semi-spaces, each ``capacity`` slots wide.  Exactly one is active;
   ``allocate`` carves objects out of its bump pointer, ``collect`` evacuates
   the live graph into the other semi-space and flips the roles.
-* Every object occupies ``2 + n_strong + n_weak`` consecutive slots::
+* Every object occupies ``2 + n_strong + n_weak + 2*n_entries`` consecutive
+  slots::
 
       [ header_tag, payload, strong_slot_0, ..., strong_slot_(s-1),
-        weak_slot_0, ..., weak_slot_(w-1) ]
+        weak_slot_0, ..., weak_slot_(w-1),
+        entry_key_0, entry_value_0, ..., entry_key_(e-1), entry_value_(e-1) ]
 
   - ``header_tag`` is a reserved slot (always ``None`` in this toy model);
     the forwarding table is kept as a side dictionary during collection,
@@ -23,9 +25,20 @@ Collection order
 -----------------
 Copy order is fully deterministic: roots in the order they were registered,
 each root's object copied immediately, then strong edges are processed in
-field order by a Cheney scan.  Weak edges never keep a target alive.  After
-the strong closure is evacuated, weak edges are rewritten: surviving
-targets point at the new address, dead targets are cleared to ``None``.
+field order by a Cheney scan.  Weak edges never keep a target alive.
+
+Weak-key entries (ephemeron-like associations) are resolved *after* the
+plain strong closure, by iterating to a fixpoint: an entry of a **live**
+table whose **key is already live** is activated, and its value is then
+treated as a strong edge (copied and scanned, which may make further keys
+-- and further tables -- live, hence the iteration).  A key referenced only
+by its own entry's value never becomes live, so dead-key entries in live
+tables are deleted (both slots cleared to ``None``); entries of dead tables
+vanish with their table.  Keys and values of activated entries are
+forwarded to their new addresses.
+
+After the entry fixpoint, weak edges are rewritten: surviving targets point
+at the new address, dead targets are cleared to ``None``.
 
 The module only implements the finite contract described in README.md; it
 is not a drop-in replacement for any production runtime GC.
@@ -103,6 +116,10 @@ class CollectionResult:
         cleared_weak_edges: ``(holder_address, field_index)`` pairs, using
             *post-collection* holder addresses, for weak fields whose
             target was unreachable and were set to ``None``.
+        cleared_entries: ``(table_address, entry_index)`` pairs, using
+            *post-collection* table addresses, for weak-key entries whose
+            key was unreachable at the fixpoint and whose key/value slots
+            were both set to ``None`` (entry deleted).
         roots_preserved: number of registered roots that were non-null and
             updated to point at their object's copy.
     """
@@ -110,6 +127,7 @@ class CollectionResult:
     relocated: dict[int, int]
     live_slots: int
     cleared_weak_edges: tuple[tuple[int, int], ...] = field(default_factory=tuple)
+    cleared_entries: tuple[tuple[int, int], ...] = field(default_factory=tuple)
     roots_preserved: int = 0
 
 
@@ -140,8 +158,8 @@ class Heap:
         self._alloc_ptr: int = 0  # first free slot in the active space
         self._epoch: int = 0
         # Object metadata, keyed by address in whichever space is active.
-        # Rebuilt during collection.  Values: (n_strong, n_weak).
-        self._layout: dict[int, tuple[int, int]] = {}
+        # Rebuilt during collection.  Values: (n_strong, n_weak, n_entries).
+        self._layout: dict[int, tuple[int, int, int]] = {}
         # Registered explicit roots: name -> address or None.
         self._roots: dict[str, int | None] = {}
         # Root insertion order (Python dict preserves it, but be explicit).
@@ -183,10 +201,12 @@ class Heap:
         *,
         n_strong: int = 0,
         n_weak: int = 0,
+        n_entries: int = 0,
     ) -> Handle:
         """Allocate one object and return its fresh :class:`Handle`.
 
-        New edge slots start ``None`` (null).  Whenever the active
+        New edge slots start ``None`` (null); new entries start vacant
+        (key and value both ``None``).  Whenever the active
         semi-space cannot satisfy the request, exactly **one** collection
         is performed first (using the registered roots); if the request
         still does not fit afterwards -- including an object larger than a
@@ -198,15 +218,21 @@ class Heap:
             payload: integer payload stored with the object.
             n_strong: number of strong edge slots (>= 0).
             n_weak: number of weak edge slots (>= 0).
+            n_entries: number of weak-key entries (>= 0); each entry costs
+                two slots (key, value) and makes the object a weak-key
+                table for collection purposes.
         """
         _check_int(payload, "payload")
         _check_int(n_strong, "n_strong")
         _check_int(n_weak, "n_weak")
+        _check_int(n_entries, "n_entries")
         if n_strong < 0:
             raise ValueError(f"n_strong must be >= 0, got {n_strong}")
         if n_weak < 0:
             raise ValueError(f"n_weak must be >= 0, got {n_weak}")
-        size = _HEADER + _PAYLOAD + n_strong + n_weak
+        if n_entries < 0:
+            raise ValueError(f"n_entries must be >= 0, got {n_entries}")
+        size = _HEADER + _PAYLOAD + n_strong + n_weak + 2 * n_entries
         if self._alloc_ptr + size > self._capacity:
             # Mandatory single emergency collection (state only changes if
             # it succeeds), then re-check against the compacted semi-space.
@@ -223,9 +249,11 @@ class Heap:
                         f"{self._capacity - self._alloc_ptr} free after collection"
                     )
                 raise HeapCapacityError(f"out of capacity: {reason}")
-        return self._write_new_object(payload, n_strong, n_weak, size)
+        return self._write_new_object(payload, n_strong, n_weak, n_entries, size)
 
-    def _write_new_object(self, payload: int, n_strong: int, n_weak: int, size: int) -> Handle:
+    def _write_new_object(
+        self, payload: int, n_strong: int, n_weak: int, n_entries: int, size: int
+    ) -> Handle:
         space = self._spaces[self._active]
         addr = self._alloc_ptr
         space[addr] = None  # header: not forwarded
@@ -235,7 +263,7 @@ class Heap:
         for i in range(2, size):
             space[addr + i] = None
         self._alloc_ptr = addr + size
-        self._layout[addr] = (n_strong, n_weak)
+        self._layout[addr] = (n_strong, n_weak, n_entries)
         return Handle(addr, self._epoch)
 
     # ------------------------------------------------------------------ #
@@ -319,7 +347,7 @@ class Heap:
     def get_strong(self, target: Handle, index: int) -> Handle | None:
         """Read strong edge ``index``; ``None`` means a null edge."""
         addr = self._resolve(target)
-        n_strong, _ = self._layout[addr]
+        n_strong, _, _ = self._layout[addr]
         self._check_index(index, n_strong, "strong")
         slot = self._spaces[self._active][addr + 2 + index]
         return None if slot is None else Handle(slot, self._epoch)
@@ -327,7 +355,7 @@ class Heap:
     def set_strong(self, target: Handle, index: int, ref: Handle | None) -> None:
         """Write strong edge ``index``; ``None`` clears it."""
         addr = self._resolve(target)
-        n_strong, _ = self._layout[addr]
+        n_strong, _, _ = self._layout[addr]
         self._check_index(index, n_strong, "strong")
         new_val = None if ref is None else self._resolve(ref)
         self._spaces[self._active][addr + 2 + index] = new_val
@@ -341,7 +369,7 @@ class Heap:
         semantics).
         """
         addr = self._resolve(target)
-        n_strong, n_weak = self._layout[addr]
+        n_strong, n_weak, _ = self._layout[addr]
         self._check_index(index, n_weak, "weak")
         slot = self._spaces[self._active][addr + 2 + n_strong + index]
         return None if slot is None else Handle(slot, self._epoch)
@@ -352,7 +380,7 @@ class Heap:
         Weak edges do not protect their target from collection.
         """
         addr = self._resolve(target)
-        n_strong, n_weak = self._layout[addr]
+        n_strong, n_weak, _ = self._layout[addr]
         self._check_index(index, n_weak, "weak")
         new_val = None if ref is None else self._resolve(ref)
         self._spaces[self._active][addr + 2 + n_strong + index] = new_val
@@ -367,7 +395,67 @@ class Heap:
 
     def object_shape(self, target: Handle) -> tuple[int, int]:
         """Return ``(n_strong, n_weak)`` for ``target``."""
-        return self._layout[self._resolve(target)]
+        n_strong, n_weak, _ = self._layout[self._resolve(target)]
+        return (n_strong, n_weak)
+
+    # ------------------------------------------------------------------ #
+    # Weak-key entries
+    # ------------------------------------------------------------------ #
+    def entry_count(self, target: Handle) -> int:
+        """Return the number of weak-key entries of ``target``."""
+        return self._layout[self._resolve(target)][2]
+
+    def _entry_base(self, addr: int, index: int) -> int:
+        """Validate ``index`` and return the key-slot offset of the entry."""
+        n_strong, n_weak, n_entries = self._layout[addr]
+        self._check_index(index, n_entries, "entry")
+        return addr + 2 + n_strong + n_weak + 2 * index
+
+    def get_entry_key(self, target: Handle, index: int) -> Handle | None:
+        """Read the key of weak-key entry ``index``; ``None`` if vacant or
+        if the key died in the most recent collection (entry deleted)."""
+        addr = self._resolve(target)
+        base = self._entry_base(addr, index)
+        slot = self._spaces[self._active][base]
+        return None if slot is None else Handle(slot, self._epoch)
+
+    def get_entry_value(self, target: Handle, index: int) -> Handle | None:
+        """Read the value of weak-key entry ``index``.
+
+        ``None`` is returned for a vacant entry, an entry without a value,
+        and an entry deleted by the most recent collection; callers cannot
+        distinguish the three (mirrors weak-reference semantics).
+        """
+        addr = self._resolve(target)
+        base = self._entry_base(addr, index)
+        slot = self._spaces[self._active][base + 1]
+        return None if slot is None else Handle(slot, self._epoch)
+
+    def set_entry(
+        self,
+        target: Handle,
+        index: int,
+        key: Handle | None,
+        value: Handle | None = None,
+    ) -> None:
+        """Write weak-key entry ``index`` as a (key, value) pair.
+
+        The key is held *weakly*: it is never kept alive by the entry.
+        The value is held *conditionally strongly*: it becomes a strong
+        edge during collection iff the table itself and the key are both
+        already live (computed to a fixpoint).  ``set_entry(h, i, None)``
+        vacates the entry; a ``None`` key with a non-``None`` value is
+        rejected because such an entry could never activate.
+        """
+        addr = self._resolve(target)
+        base = self._entry_base(addr, index)
+        new_key = None if key is None else self._resolve(key)
+        new_val = None if value is None else self._resolve(value)
+        if new_key is None and new_val is not None:
+            raise ValueError("entry with a null key cannot hold a value")
+        space = self._spaces[self._active]
+        space[base] = new_key
+        space[base + 1] = new_val
 
     # ------------------------------------------------------------------ #
     # Collection
@@ -375,11 +463,22 @@ class Heap:
     def collect(self) -> CollectionResult:
         """Run one stop-the-world semi-space collection.
 
-        Reachability is computed solely from registered roots through
-        strong edges.  Surviving objects are copied into the inactive
-        semi-space in root order / strong-field order (Cheney scanning).
-        Roots, strong edges and the weak edges that name survivors are
-        forwarded; weak edges naming dead objects are cleared.
+        Reachability starts from registered roots through strong edges.
+        Then weak-key entries are resolved to a fixpoint: repeatedly,
+        every entry of a *live* table whose key is *already live* is
+        activated and its value joins the strong graph (copied and
+        Cheney-scanned like any strong target), until no entry can
+        activate any more.  A key kept "alive" only by its own entry's
+        value therefore still dies.  Entries of live tables whose keys
+        stayed dead are deleted (both slots cleared); entries of dead
+        tables vanish with their table.  Weak edges never keep a target
+        alive.
+
+        Surviving objects are copied into the inactive semi-space in root
+        order / strong-field order / entry-activation order (Cheney
+        scanning).  Roots, strong edges, activated entry keys and values,
+        and the weak edges that name survivors are forwarded; weak edges
+        naming dead objects are cleared.
 
         On success the heap flips semi-spaces and its epoch advances by
         one.  The operation is all-or-nothing: if the live set does not
@@ -397,19 +496,22 @@ class Heap:
         # Forwarding table: old address -> new address.  Doubles as the
         # mark set (an object is copied iff it appears here).
         fwd: dict[int, int] = {}
-        new_layout: dict[int, tuple[int, int]] = {}
+        new_layout: dict[int, tuple[int, int, int]] = {}
         scan = 0  # Cheney scan cursor over *destination* addresses
         free = 0  # bump pointer in destination
         relocated: dict[int, int] = {}
         new_roots: dict[str, int | None] = {}
         roots_preserved = 0
+        # Destination addresses of live weak-key tables, in copy order
+        # (== destination-address ascending order).
+        live_tables: list[int] = []
 
         def copy_obj(old: int) -> int:
             nonlocal free
             if old in fwd:  # NB: new address 0 is legitimate; never use .get()
                 return fwd[old]
-            n_strong, n_weak = old_layout[old]
-            size = _HEADER + _PAYLOAD + n_strong + n_weak
+            n_strong, n_weak, n_entries = old_layout[old]
+            size = _HEADER + _PAYLOAD + n_strong + n_weak + 2 * n_entries
             if free + size > capacity:
                 raise HeapCapacityError(
                     f"live set does not fit: needed {size} slot(s) at offset {free}, "
@@ -420,12 +522,27 @@ class Heap:
             # Blind bulk copy of the slot window, then fix up fields below.
             dst[new : new + size] = src[old : old + size]
             fwd[old] = new
-            new_layout[new] = (n_strong, n_weak)
+            new_layout[new] = (n_strong, n_weak, n_entries)
             relocated[old] = new
+            if n_entries:
+                live_tables.append(new)
             return new
 
-        # Phase 1: evacuate roots in registration order.
+        def scan_strong_closure() -> None:
+            """Drain the Cheney scan queue over strong edges, field order."""
+            nonlocal scan
+            while scan < free:
+                new = scan
+                n_strong, n_weak, n_entries = new_layout[new]
+                strong_base = new + 2
+                for j in range(n_strong):
+                    old_target = dst[strong_base + j]
+                    if old_target is not None:
+                        dst[strong_base + j] = copy_obj(old_target)
+                scan = new + _HEADER + _PAYLOAD + n_strong + n_weak + 2 * n_entries
+
         try:
+            # Phase 1: evacuate roots in registration order.
             for name in self._root_order:
                 old_root = self._roots[name]
                 if old_root is None:
@@ -434,25 +551,66 @@ class Heap:
                     new_roots[name] = copy_obj(old_root)
                     roots_preserved += 1
 
-            # Phase 2: Cheney scan of the strong closure, field order preserved.
-            while scan < free:
-                new = scan
-                n_strong, n_weak = new_layout[new]
-                strong_base = new + 2
-                for j in range(n_strong):
-                    old_target = dst[strong_base + j]
-                    if old_target is not None:
-                        dst[strong_base + j] = copy_obj(old_target)
-                scan = new + _HEADER + _PAYLOAD + n_strong + n_weak
+            # Phase 2: Cheney scan of the plain strong closure.
+            scan_strong_closure()
+
+            # Phase 3: weak-key entry fixpoint.  An entry activates iff its
+            # table is live (it is in live_tables) and its key is already in
+            # fwd.  Activation forwards the key and treats the value as a
+            # strong edge; copied values may make further keys/tables live,
+            # so this iterates until nothing new activates.  Keys are never
+            # copied by activation itself, so a key referenced only by its
+            # own value cannot bootstrap itself.
+            activated: set[tuple[int, int]] = set()  # (new table addr, entry idx)
+            while True:
+                progress = False
+                for new in live_tables:
+                    n_strong, n_weak, n_entries = new_layout[new]
+                    entry_base = new + 2 + n_strong + n_weak
+                    for i in range(n_entries):
+                        if (new, i) in activated:
+                            continue
+                        key_slot = entry_base + 2 * i
+                        old_key = dst[key_slot]
+                        if old_key is None:
+                            # Vacant entry: can never activate.
+                            activated.add((new, i))
+                            continue
+                        if old_key in fwd:
+                            old_val = dst[key_slot + 1]
+                            dst[key_slot] = fwd[old_key]
+                            dst[key_slot + 1] = (
+                                None if old_val is None else copy_obj(old_val)
+                            )
+                            activated.add((new, i))
+                            progress = True
+                scan_strong_closure()
+                if not progress:
+                    break
 
             live_slots = free
 
-            # Phase 3: fix weak edges of survivors.  Weak targets never became
+            # Phase 4: delete dead-key entries of live tables (both slots
+            # cleared).  Vacant entries are already (None, None).
+            cleared_entries: list[tuple[int, int]] = []
+            for new in live_tables:
+                n_strong, n_weak, n_entries = new_layout[new]
+                entry_base = new + 2 + n_strong + n_weak
+                for i in range(n_entries):
+                    if (new, i) in activated:
+                        continue
+                    key_slot = entry_base + 2 * i
+                    if dst[key_slot] is not None:
+                        cleared_entries.append((new, i))
+                    dst[key_slot] = None
+                    dst[key_slot + 1] = None
+
+            # Phase 5: fix weak edges of survivors.  Weak targets never became
             # part of the closure, so they are either in fwd (alive elsewhere)
             # or unreachable -> clear.
             cleared: list[tuple[int, int]] = []
             for new in sorted(new_layout):
-                n_strong, n_weak = new_layout[new]
+                n_strong, n_weak, _ = new_layout[new]
                 weak_base = new + 2 + n_strong
                 for j in range(n_weak):
                     old_target = dst[weak_base + j]
@@ -486,6 +644,7 @@ class Heap:
             relocated=relocated,
             live_slots=live_slots,
             cleared_weak_edges=tuple(cleared),
+            cleared_entries=tuple(cleared_entries),
             roots_preserved=roots_preserved,
         )
 
@@ -506,7 +665,7 @@ class Heap:
             if addr in seen:
                 continue
             seen.add(addr)
-            n_strong, _ = self._layout[addr]
+            n_strong, _, _ = self._layout[addr]
             for j in range(n_strong):
                 t = space[addr + 2 + j]
                 if t is not None and t not in seen:

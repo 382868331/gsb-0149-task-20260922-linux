@@ -35,7 +35,10 @@ def build_world(spec: GraphSpec) -> tuple[Heap, dict[str, Handle]]:
     handles: dict[str, Handle] = {}
     for name, node in spec.nodes.items():
         handles[name] = heap.allocate(
-            node.payload, n_strong=len(node.strong), n_weak=len(node.weak)
+            node.payload,
+            n_strong=len(node.strong),
+            n_weak=len(node.weak),
+            n_entries=len(node.entries),
         )
     for name, node in spec.nodes.items():
         for j, dst in enumerate(node.strong):
@@ -44,6 +47,14 @@ def build_world(spec: GraphSpec) -> tuple[Heap, dict[str, Handle]]:
         for j, dst in enumerate(node.weak):
             if dst is not None:
                 heap.set_weak(handles[name], j, handles[dst])
+        for j, (k, v) in enumerate(node.entries):
+            if k is not None or v is not None:
+                heap.set_entry(
+                    handles[name],
+                    j,
+                    None if k is None else handles[k],
+                    None if v is None else handles[v],
+                )
     for rn in spec.root_order:
         t = spec.roots[rn]
         if t is not None:
@@ -97,6 +108,12 @@ def verify_against_oracle(
     )
     assert result.cleared_weak_edges == exp_cleared
 
+    # --- deleted weak-key entries -------------------------------------------
+    exp_cleared_entries = tuple(
+        (name_to_new[table], i) for table, i in expected.cleared_entries
+    )
+    assert result.cleared_entries == exp_cleared_entries
+
     # --- payloads and every edge -------------------------------------------
     fresh: dict[str, Handle] = {
         name: heap.handle(new) for name, new in name_to_new.items()
@@ -118,6 +135,20 @@ def verify_against_oracle(
                 assert got is None, (name, j, t)
             else:
                 assert got is not None and got.address == name_to_new[t], (name, j, t)
+        # The oracle has already committed post-collection entry state, so
+        # surviving entries hold exactly the forwarded (key, value) pairs
+        # and deleted entries are vacant.
+        for j, (k, v) in enumerate(node.entries):
+            got_k = heap.get_entry_key(h, j)
+            got_v = heap.get_entry_value(h, j)
+            if k is None:
+                assert got_k is None and got_v is None, (name, j)
+            else:
+                assert got_k is not None and got_k.address == name_to_new[k], (name, j)
+                if v is None:
+                    assert got_v is None, (name, j)
+                else:
+                    assert got_v is not None and got_v.address == name_to_new[v], (name, j)
     return fresh
 
 
@@ -314,6 +345,200 @@ class TestGraphScenarios(unittest.TestCase):
         self.assertIsNone(heap.get_weak(fresh["a"], 0))
         self.assertEqual(heap.get_weak(fresh["a"], 1), fresh["s"])
         self.assertIsNone(heap.get_weak(fresh["b"], 0))
+
+
+# --------------------------------------------------------------------------- #
+# Weak-key entries (ephemeron-like associations)
+# --------------------------------------------------------------------------- #
+class TestWeakKeyEntries(unittest.TestCase):
+    def _run_one(self, spec: GraphSpec):
+        heap, _ = build_world(spec)
+        old = old_address_map(spec)
+        result = heap.collect()
+        expected = spec.expected_collect()
+        return heap, verify_against_oracle(spec, heap, expected, result, old), result
+
+    def test_two_level_activation_chain(self):
+        # Level 1: T1[K1] = V1 activates because K1 is rooted; copying V1
+        # keeps T2 and K2 alive.  Level 2: only then can T2[K2] = V2
+        # activate.  A single scan pass would lose V2.
+        spec = GraphSpec(64)
+        spec.add_node("g")  # garbage to force real movement
+        spec.add_node("t1", 11, n_entries=1)
+        spec.add_node("k1", 21)
+        spec.add_node("v1", 31, n_strong=2)
+        spec.add_node("t2", 12, n_entries=1)
+        spec.add_node("k2", 22)
+        spec.add_node("v2", 32)
+        spec.link_entry("t1", 0, "k1", "v1")
+        spec.link_strong("v1", 0, "t2")
+        spec.link_strong("v1", 1, "k2")
+        spec.link_entry("t2", 0, "k2", "v2")
+        spec.add_root("rt", "t1")
+        spec.add_root("rk", "k1")
+        heap, fresh, result = self._run_one(spec)
+        # The whole chain survived, including the second-level value.
+        for name in ("t1", "k1", "v1", "t2", "k2", "v2"):
+            self.assertIn(name, fresh)
+        self.assertEqual(len(result.relocated), 6)
+        # Keys and values were forwarded to their new addresses.
+        self.assertEqual(heap.get_entry_key(fresh["t1"], 0), fresh["k1"])
+        self.assertEqual(heap.get_entry_value(fresh["t1"], 0), fresh["v1"])
+        self.assertEqual(heap.get_entry_key(fresh["t2"], 0), fresh["k2"])
+        self.assertEqual(heap.get_entry_value(fresh["t2"], 0), fresh["v2"])
+        self.assertEqual(result.cleared_entries, ())
+
+    def test_key_value_ring_without_external_root_dies(self):
+        # T is rooted; entry (K, V) where V strongly references K and K is
+        # reachable from *nothing* else.  The ring must not bootstrap
+        # itself: K, V die and the entry is deleted.
+        spec = GraphSpec(32)
+        spec.add_node("t", 1, n_entries=1)
+        spec.add_node("k", 2)
+        spec.add_node("v", 3, n_strong=1)
+        spec.link_entry("t", 0, "k", "v")
+        spec.link_strong("v", 0, "k")  # value -> key back-reference
+        spec.add_root("r", "t")
+        heap, fresh, result = self._run_one(spec)
+        self.assertEqual(set(fresh), {"t"})
+        self.assertIsNone(heap.get_entry_key(fresh["t"], 0))
+        self.assertIsNone(heap.get_entry_value(fresh["t"], 0))
+        self.assertEqual(result.cleared_entries, ((fresh["t"].address, 0),))
+
+    def test_dead_table_entry_never_activates(self):
+        # The table is unreachable, so its entry must not activate even
+        # though the key is alive: the value dies with the table.
+        spec = GraphSpec(32)
+        spec.add_node("t", 1, n_entries=1)  # unrooted table
+        spec.add_node("k", 2)
+        spec.add_node("v", 3)
+        spec.link_entry("t", 0, "k", "v")
+        spec.add_root("rk", "k")
+        heap, fresh, result = self._run_one(spec)
+        self.assertEqual(set(fresh), {"k"})
+        self.assertEqual(len(result.relocated), 1)  # only k survived
+        self.assertEqual(result.cleared_entries, ())  # dead tables report nothing
+
+    def test_entry_value_dies_when_key_dies(self):
+        # Live table, key not kept alive elsewhere: key and value both die.
+        spec = GraphSpec(32)
+        spec.add_node("t", 1, n_entries=1)
+        spec.add_node("k", 2)
+        spec.add_node("v", 3)
+        spec.link_entry("t", 0, "k", "v")
+        spec.add_root("r", "t")
+        heap, fresh, result = self._run_one(spec)
+        self.assertEqual(set(fresh), {"t"})
+        self.assertEqual(result.cleared_entries, ((fresh["t"].address, 0),))
+
+    def test_key_alive_via_other_entry_value(self):
+        # K2 is kept alive only by V1 (the value of T1's entry); T2's entry
+        # then activates.  Values make other entries' keys live.
+        spec = GraphSpec(48)
+        spec.add_node("t1", 1, n_entries=1)
+        spec.add_node("t2", 2, n_entries=1)
+        spec.add_node("k1", 3)
+        spec.add_node("v1", 4, n_strong=1)
+        spec.add_node("k2", 5)
+        spec.add_node("v2", 6)
+        spec.link_entry("t1", 0, "k1", "v1")
+        spec.link_strong("v1", 0, "k2")
+        spec.link_entry("t2", 0, "k2", "v2")
+        spec.add_root("r1", "t1")
+        spec.add_root("r2", "t2")
+        spec.add_root("rk", "k1")
+        heap, fresh, result = self._run_one(spec)
+        self.assertEqual(set(fresh), {"t1", "t2", "k1", "v1", "k2", "v2"})
+        self.assertEqual(heap.get_entry_value(fresh["t2"], 0), fresh["v2"])
+
+    def test_entries_capacity_exhaustion(self):
+        # Exactly-full heap where entries keep the values alive: the
+        # emergency collection reclaims nothing and the next allocation
+        # fails with HeapCapacityError, leaving no half object.
+        # Sizes: t=4 (2+2*1), k=2, v=2 -> 8 slots, exactly full.
+        heap = Heap(8)
+        t = heap.allocate(1, n_entries=1)
+        k = heap.allocate(2)
+        v = heap.allocate(3)
+        heap.set_entry(t, 0, k, v)
+        heap.add_root("rt", t)
+        heap.add_root("rk", k)
+        self.assertEqual(heap.used_slots, 8)
+        epoch = heap.epoch
+        with self.assertRaises(HeapCapacityError):
+            heap.allocate(9)
+        # One emergency collection ran; the entry kept v alive, so the
+        # heap is still exactly full and no half object exists.
+        self.assertEqual(heap.epoch, epoch + 1)
+        self.assertEqual(heap.used_slots, 8)
+        self.assertEqual(len(heap.objects()), 3)
+        fresh_t = heap.root_handle("rt")
+        self.assertEqual(heap.payload(heap.get_entry_value(fresh_t, 0)), 3)
+
+    def test_entry_api_contract(self):
+        heap = Heap(24)
+        t = heap.allocate(1, n_entries=2)
+        k = heap.allocate(2)
+        v = heap.allocate(3)
+        self.assertEqual(heap.entry_count(t), 2)
+        self.assertIsNone(heap.get_entry_key(t, 0))
+        self.assertIsNone(heap.get_entry_value(t, 0))
+        heap.set_entry(t, 0, k, v)
+        self.assertEqual(heap.get_entry_key(t, 0), k)
+        self.assertEqual(heap.get_entry_value(t, 0), v)
+        heap.set_entry(t, 0, None)  # vacate
+        self.assertIsNone(heap.get_entry_key(t, 0))
+        self.assertIsNone(heap.get_entry_value(t, 0))
+        # Null key with a value is rejected (could never activate).
+        with self.assertRaises(ValueError):
+            heap.set_entry(t, 1, None, v)
+        with self.assertRaises(IndexError):
+            heap.get_entry_key(t, 2)
+        with self.assertRaises(IndexError):
+            heap.set_entry(t, -1, k, v)
+        with self.assertRaises(TypeError):
+            heap.set_entry(t, 0, k, "not-a-handle")
+        with self.assertRaises(TypeError):
+            heap.get_entry_key(t, True)
+        with self.assertRaises(ValueError):
+            heap.allocate(0, n_entries=-1)
+        with self.assertRaises(TypeError):
+            heap.allocate(0, n_entries=True)
+
+    def test_stale_handles_rejected_on_entry_apis(self):
+        heap = Heap(24)
+        heap.allocate(0)  # garbage to force movement
+        t = heap.allocate(1, n_entries=1)
+        k = heap.allocate(2)
+        heap.set_entry(t, 0, k, None)
+        heap.add_root("r", t)
+        heap.add_root("rk", k)  # key stays alive so the entry is forwarded
+        heap.collect()
+        fresh_t = heap.root_handle("r")
+        # Key with no value still had its slot forwarded.
+        self.assertIsNotNone(heap.get_entry_key(fresh_t, 0))
+        with self.assertRaises(StaleHandleError):
+            heap.get_entry_key(t, 0)
+        with self.assertRaises(StaleHandleError):
+            heap.get_entry_value(t, 0)
+        with self.assertRaises(StaleHandleError):
+            heap.set_entry(fresh_t, 0, k, None)  # stale key handle
+        with self.assertRaises(StaleHandleError):
+            heap.entry_count(t)
+        # Failed write did not mutate the forwarded entry.
+        self.assertIsNotNone(heap.get_entry_key(fresh_t, 0))
+
+    def test_entry_key_is_not_a_strong_edge(self):
+        # A key stored in an entry of a live table but referenced nowhere
+        # else dies, exactly like a weak-edge target.
+        spec = GraphSpec(24)
+        spec.add_node("t", 1, n_entries=1)
+        spec.add_node("k", 2)
+        spec.link_entry("t", 0, "k", None)
+        spec.add_root("r", "t")
+        heap, fresh, result = self._run_one(spec)
+        self.assertEqual(set(fresh), {"t"})
+        self.assertEqual(result.cleared_entries, ((fresh["t"].address, 0),))
 
 
 # --------------------------------------------------------------------------- #
@@ -586,14 +811,15 @@ class TestDifferentialFuzz(unittest.TestCase):
             def add_node(name):
                 ns = rng.randrange(0, 3)
                 nw = rng.randrange(0, 2)
-                if 2 + ns + nw > cap:
+                ne = rng.randrange(0, 2)
+                if 2 + ns + nw + 2 * ne > cap:
                     return False
                 try:
-                    spec.add_node(name, rng.randrange(0, 1_000_000), ns, nw)
+                    spec.add_node(name, rng.randrange(0, 1_000_000), ns, nw, ne)
                 except RuntimeError:
                     return False
                 handles[name] = heap.allocate(
-                    spec.nodes[name].payload, n_strong=ns, n_weak=nw
+                    spec.nodes[name].payload, n_strong=ns, n_weak=nw, n_entries=ne
                 )
                 return True
 
@@ -613,6 +839,17 @@ class TestDifferentialFuzz(unittest.TestCase):
                         t = rng.choice(names)
                         spec.link_weak(name, j, t)
                         heap.set_weak(handles[name], j, handles[t])
+                for j in range(len(node.entries)):
+                    if rng.random() < 0.6:
+                        k = rng.choice(names)
+                        v = rng.choice(names) if rng.random() < 0.8 else None
+                        spec.link_entry(name, j, k, v)
+                        heap.set_entry(
+                            handles[name],
+                            j,
+                            handles[k],
+                            None if v is None else handles[v],
+                        )
 
             rooted = rng.sample(names, k=max(1, len(names) // 3))
             for k, name in enumerate(rooted):
