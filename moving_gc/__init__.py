@@ -16,15 +16,23 @@ from .core import (
     CollectionResult,
     Handle,
     Heap,
+    PinHandle,
 )
-from .errors import GCError, HeapCapacityError, StaleHandleError
+from .errors import (
+    FragmentationError,
+    GCError,
+    HeapCapacityError,
+    StaleHandleError,
+)
 
 __all__ = [
     "Heap",
     "Handle",
+    "PinHandle",
     "CollectionResult",
     "GCError",
     "StaleHandleError",
     "HeapCapacityError",
+    "FragmentationError",
     "MAX_CAPACITY",
 ]

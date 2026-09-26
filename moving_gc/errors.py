@@ -27,3 +27,15 @@ class HeapCapacityError(GCError):
     caller's behalf; the surviving working set genuinely does not fit,
     or the single object is larger than the semi-space capacity.
     """
+
+
+class FragmentationError(HeapCapacityError):
+    """Pinning mode: enough free slots overall, but no contiguous run.
+
+    Raised only by heaps created with ``pinning=True`` when an allocation
+    still finds no contiguous free slot window after one emergency
+    collection, even though the total number of free slots would suffice.
+    It is a subclass of :class:`HeapCapacityError` so capacity handling
+    stays uniform; the distinct type lets callers tell fragmented apart
+    from genuinely out of space.
+    """

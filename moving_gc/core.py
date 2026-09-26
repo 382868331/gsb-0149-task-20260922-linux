@@ -36,15 +36,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from math import isinf, isnan
 
-from .errors import HeapCapacityError, StaleHandleError
+from .errors import FragmentationError, GCError, HeapCapacityError, StaleHandleError
 
 __all__ = [
     "Heap",
     "Handle",
+    "PinHandle",
     "CollectionResult",
     "GCError",
     "StaleHandleError",
     "HeapCapacityError",
+    "FragmentationError",
     "MAX_CAPACITY",
 ]
 
@@ -91,6 +93,26 @@ class Handle:
 
 
 @dataclass(frozen=True)
+class PinHandle:
+    """Stable external reference to a pinned object (pinning mode only).
+
+    A pin handle simulates external code holding a stable *logical* slot
+    address across collections: while at least one pin on an object is
+    outstanding, the object is a strong root and is never relocated.
+    This is not a promise about real Python memory addresses.
+
+    ``generation`` is an independent per-pin serial number (unrelated to
+    the heap epoch).  Repeated pins of the same object are counted
+    separately; releasing one handle does not lift the others.  Once a
+    pin is released its generation is forgotten, so a stale pin handle
+    can never operate on a different object that later reuses the slot.
+    """
+
+    address: int
+    generation: int
+
+
+@dataclass(frozen=True)
 class CollectionResult:
     """Outcome of one :meth:`Heap.collect` call.
 
@@ -105,12 +127,16 @@ class CollectionResult:
             target was unreachable and were set to ``None``.
         roots_preserved: number of registered roots that were non-null and
             updated to point at their object's copy.
+        pinned_addresses: addresses kept fixed during this collection
+            (pinning mode only; empty tuple otherwise).  In pinning mode
+            ``relocated`` only contains objects that actually moved.
     """
 
     relocated: dict[int, int]
     live_slots: int
     cleared_weak_edges: tuple[tuple[int, int], ...] = field(default_factory=tuple)
     roots_preserved: int = 0
+    pinned_addresses: tuple[int, ...] = ()
 
 
 class Heap:
@@ -124,11 +150,14 @@ class Heap:
         ValueError: ``capacity`` is out of range.
     """
 
-    def __init__(self, capacity: int) -> None:
+    def __init__(self, capacity: int, *, pinning: bool = False) -> None:
         _check_int(capacity, "capacity")
         if not (1 <= capacity <= MAX_CAPACITY):
             raise ValueError(f"capacity must be in [1, {MAX_CAPACITY}], got {capacity}")
+        if not isinstance(pinning, bool):
+            raise TypeError(f"pinning must be a bool, got {type(pinning).__name__}")
         self._capacity: int = capacity
+        self._pinning: bool = pinning
         # Two semi-spaces: lists of slot values.  Free slots hold None;
         # object header slots are reserved (None); data slots hold an int
         # payload/address, or None for a null edge.
@@ -146,6 +175,11 @@ class Heap:
         self._roots: dict[str, int | None] = {}
         # Root insertion order (Python dict preserves it, but be explicit).
         self._root_order: list[str] = []
+        # Pinning mode: address -> list of live pin generations (one entry
+        # per outstanding pin; repeated pins are counted separately), plus
+        # the monotonic serial that mints independent generations.
+        self._pins: dict[int, list[int]] = {}
+        self._pin_serial: int = 0
 
     # ------------------------------------------------------------------ #
     # Introspection
@@ -162,13 +196,20 @@ class Heap:
 
     @property
     def used_slots(self) -> int:
-        """Slots currently occupied in the active semi-space."""
+        """Slots currently occupied in the active semi-space.
+
+        In the default Cheney mode this equals the bump pointer; in
+        pinning mode (where holes may exist between pinned objects) it is
+        the sum of live object sizes.
+        """
+        if self._pinning:
+            return sum(2 + s + w for s, w in self._layout.values())
         return self._alloc_ptr
 
     @property
     def free_slots(self) -> int:
         """Free slots in the active semi-space."""
-        return self._capacity - self._alloc_ptr
+        return self._capacity - self.used_slots
 
     def objects(self) -> tuple[int, ...]:
         """Addresses (header slots) of all objects currently in the heap."""
@@ -207,6 +248,8 @@ class Heap:
         if n_weak < 0:
             raise ValueError(f"n_weak must be >= 0, got {n_weak}")
         size = _HEADER + _PAYLOAD + n_strong + n_weak
+        if self._pinning:
+            return self._allocate_pinning(payload, n_strong, n_weak, size)
         if self._alloc_ptr + size > self._capacity:
             # Mandatory single emergency collection (state only changes if
             # it succeeds), then re-check against the compacted semi-space.
@@ -224,6 +267,113 @@ class Heap:
                     )
                 raise HeapCapacityError(f"out of capacity: {reason}")
         return self._write_new_object(payload, n_strong, n_weak, size)
+
+    # ------------------------------------------------------------------ #
+    # Pinning mode: handles, gap allocation
+    # ------------------------------------------------------------------ #
+    @property
+    def pinning(self) -> bool:
+        """Whether this heap runs in pinning (mark-compact) mode."""
+        return self._pinning
+
+    def pin(self, target: Handle) -> PinHandle:
+        """Pin the object behind ``target`` and return a :class:`PinHandle`.
+
+        Each call is counted separately: pinning the same object twice
+        requires two releases before it can move again.  Only available
+        on heaps created with pinning=True.
+        """
+        if not self._pinning:
+            raise GCError("pin() requires a heap created with pinning=True")
+        addr = self._resolve(target)
+        generation = self._pin_serial
+        self._pin_serial += 1
+        self._pins.setdefault(addr, []).append(generation)
+        return PinHandle(addr, generation)
+
+    def release(self, pin_handle: PinHandle) -> None:
+        """Release one outstanding pin.
+
+        Releasing one handle never lifts the remaining pins on the same
+        object.  A handle whose generation was already released (or never
+        issued) is rejected, so a stale pin handle cannot operate on a
+        new object that later reuses the address.
+        """
+        if not isinstance(pin_handle, PinHandle):
+            raise TypeError(f"expected PinHandle, got {type(pin_handle).__name__}")
+        gens = self._pins.get(pin_handle.address)
+        if not gens or pin_handle.generation not in gens:
+            raise StaleHandleError(
+                f"stale pin handle: generation {pin_handle.generation} not live "
+                f"at address {pin_handle.address}"
+            )
+        gens.remove(pin_handle.generation)
+        if not gens:
+            del self._pins[pin_handle.address]
+
+    def pin_count(self, address: int) -> int:
+        """Number of outstanding pins on the object at ``address``."""
+        _check_int(address, "address")
+        return len(self._pins.get(address, ()))
+
+    def pinned_addresses(self) -> tuple[int, ...]:
+        """Sorted addresses of all currently pinned objects."""
+        return tuple(sorted(self._pins))
+
+    def _free_gaps(self) -> list[tuple[int, int]]:
+        """Sorted (start, length) free runs in the active semi-space."""
+        gaps: list[tuple[int, int]] = []
+        cursor = 0
+        for addr in sorted(self._layout):
+            n_strong, n_weak = self._layout[addr]
+            if addr > cursor:
+                gaps.append((cursor, addr - cursor))
+            cursor = addr + _HEADER + _PAYLOAD + n_strong + n_weak
+        if cursor < self._capacity:
+            gaps.append((cursor, self._capacity - cursor))
+        return gaps
+
+    def _allocate_pinning(self, payload: int, n_strong: int, n_weak: int, size: int) -> Handle:
+        addr = self._first_fit(size)
+        if addr is None:
+            # Same contract as Cheney mode: exactly one emergency
+            # collection, then re-check against the compacted heap.
+            self.collect()
+            addr = self._first_fit(size)
+            if addr is None:
+                if size > self._capacity:
+                    raise HeapCapacityError(
+                        f"out of capacity: object size {size} exceeds semi-space "
+                        f"capacity {self._capacity}"
+                    )
+                free = self._capacity - self.used_slots
+                if free >= size:
+                    raise FragmentationError(
+                        f"fragmented heap: need {size} contiguous slot(s), "
+                        f"{free} free in total but no contiguous run fits"
+                    )
+                raise HeapCapacityError(
+                    f"out of capacity: need {size} slot(s), "
+                    f"{free} free after collection"
+                )
+        return self._write_new_object_at(addr, payload, n_strong, n_weak, size)
+
+    def _first_fit(self, size: int) -> int | None:
+        for start, length in self._free_gaps():
+            if length >= size:
+                return start
+        return None
+
+    def _write_new_object_at(
+        self, addr: int, payload: int, n_strong: int, n_weak: int, size: int
+    ) -> Handle:
+        space = self._spaces[self._active]
+        space[addr] = None  # header: not forwarded
+        space[addr + 1] = payload
+        for i in range(2, size):
+            space[addr + i] = None
+        self._layout[addr] = (n_strong, n_weak)
+        return Handle(addr, self._epoch)
 
     def _write_new_object(self, payload: int, n_strong: int, n_weak: int, size: int) -> Handle:
         space = self._spaces[self._active]
@@ -293,7 +443,19 @@ class Heap:
         return Handle(address, self._epoch)
 
     def _resolve(self, target: Handle) -> int:
-        """Validate a handle and return its current-space address."""
+        """Validate a handle (or pin handle) and return its address."""
+        if isinstance(target, PinHandle):
+            gens = self._pins.get(target.address)
+            if not gens or target.generation not in gens:
+                raise StaleHandleError(
+                    f"stale pin handle: generation {target.generation} not live "
+                    f"at address {target.address}"
+                )
+            if target.address not in self._layout:
+                raise StaleHandleError(
+                    f"no live object at address {target.address}"
+                )
+            return target.address
         if not isinstance(target, Handle):
             raise TypeError(f"expected Handle, got {type(target).__name__}")
         if target.epoch != self._epoch:
@@ -373,6 +535,17 @@ class Heap:
     # Collection
     # ------------------------------------------------------------------ #
     def collect(self) -> CollectionResult:
+        """Run one stop-the-world collection.
+
+        Default heaps use Cheney semi-space copying; heaps created with
+        pinning=True use in-place sliding compaction around pinned
+        objects.  See the mode-specific docstrings for the contracts.
+        """
+        if self._pinning:
+            return self._collect_compact()
+        return self._collect_cheney()
+
+    def _collect_cheney(self) -> CollectionResult:
         """Run one stop-the-world semi-space collection.
 
         Reachability is computed solely from registered roots through
@@ -489,6 +662,128 @@ class Heap:
             roots_preserved=roots_preserved,
         )
 
+    def _collect_compact(self) -> CollectionResult:
+        """Pinning-mode collection: sliding compaction around pinned objects.
+
+        Reachability starts from explicit roots *and* pinned addresses
+        (pins are strong roots) and follows strong edges only.  Pinned
+        survivors keep their slots; movable survivors slide, in address
+        order, into the lowest free slots not covered by a pinned object.
+        Roots, strong edges and weak edges naming survivors are
+        forwarded; weak edges naming dead objects are cleared.  The heap
+        epoch still advances by one, so ordinary Handles minted before
+        the collection are rejected afterwards, exactly as in Cheney
+        mode; PinHandles stay valid because their object never moved.
+        """
+        space = self._spaces[self._active]
+        old_layout = self._layout
+        capacity = self._capacity
+
+        # Phase 1: reachability from roots and pins, strong edges only.
+        reachable: set[int] = set()
+        stack = [a for a in self._roots.values() if a is not None]
+        stack.extend(addr for addr in self._pins if addr in old_layout)
+        while stack:
+            addr = stack.pop()
+            if addr in reachable:
+                continue
+            reachable.add(addr)
+            n_strong, _ = old_layout[addr]
+            for j in range(n_strong):
+                t = space[addr + 2 + j]
+                if t is not None and t not in reachable:
+                    stack.append(t)
+
+        # Phase 2: compute new addresses.  Pinned objects stay; movable
+        # objects are placed by an order-preserving first fit that skips
+        # pinned intervals.
+        pinned_intervals = sorted(
+            (addr, addr + _HEADER + _PAYLOAD + s + w)
+            for addr, (s, w) in old_layout.items()
+            if addr in self._pins
+        )
+        fwd: dict[int, int] = {}
+        free = 0
+        pin_idx = 0
+        for old in sorted(reachable):
+            n_strong, n_weak = old_layout[old]
+            size = _HEADER + _PAYLOAD + n_strong + n_weak
+            if old in self._pins:
+                fwd[old] = old
+                continue
+            while True:
+                while pin_idx < len(pinned_intervals) and pinned_intervals[pin_idx][1] <= free:
+                    pin_idx += 1
+                if pin_idx < len(pinned_intervals) and pinned_intervals[pin_idx][0] < free + size:
+                    free = pinned_intervals[pin_idx][1]
+                    pin_idx += 1
+                    continue
+                break
+            if free + size > capacity:
+                # Cannot happen when the source layout was legal (the
+                # live set is a subset sliding left); defended anyway.
+                raise HeapCapacityError(
+                    f"live set does not fit around pinned objects: needed {size} "
+                    f"slot(s) at offset {free}, capacity {capacity}"
+                )
+            fwd[old] = free
+            free += size
+
+        # Phase 3: rewrite the space from a snapshot so overlapping
+        # moves cannot clobber objects that have not been placed yet.
+        snapshot = list(space)
+        for i in range(capacity):
+            space[i] = None
+        new_layout: dict[int, tuple[int, int]] = {}
+        relocated: dict[int, int] = {}
+        cleared: list[tuple[int, int]] = []
+        for old in sorted(reachable):
+            new = fwd[old]
+            n_strong, n_weak = old_layout[old]
+            size = _HEADER + _PAYLOAD + n_strong + n_weak
+            space[new : new + size] = snapshot[old : old + size]
+            for j in range(n_strong):
+                t = snapshot[old + 2 + j]
+                if t is not None:
+                    space[new + 2 + j] = fwd[t]
+            weak_base_old = old + 2 + n_strong
+            weak_base_new = new + 2 + n_strong
+            for j in range(n_weak):
+                t = snapshot[weak_base_old + j]
+                if t is None:
+                    continue
+                if t in fwd:
+                    space[weak_base_new + j] = fwd[t]
+                else:
+                    space[weak_base_new + j] = None
+                    cleared.append((new, j))
+            new_layout[new] = (n_strong, n_weak)
+            if new != old:
+                relocated[old] = new
+
+        new_roots: dict[str, int | None] = {}
+        roots_preserved = 0
+        for name in self._root_order:
+            old_root = self._roots[name]
+            if old_root is None:
+                new_roots[name] = None
+            else:
+                new_roots[name] = fwd[old_root]
+                roots_preserved += 1
+
+        self._layout = new_layout
+        self._roots = new_roots
+        self._alloc_ptr = 0  # unused in pinning mode; see used_slots
+        self._epoch += 1
+
+        return CollectionResult(
+            relocated=relocated,
+            live_slots=sum(2 + s + w for s, w in new_layout.values()),
+            cleared_weak_edges=tuple(cleared),
+            roots_preserved=roots_preserved,
+            pinned_addresses=tuple(sorted(self._pins)),
+        )
+
     # ------------------------------------------------------------------ #
     # Convenience
     # ------------------------------------------------------------------ #
@@ -500,6 +795,8 @@ class Heap:
         """
         seen: set[int] = set()
         stack = [a for a in self._roots.values() if a is not None]
+        if self._pinning:
+            stack.extend(addr for addr in self._pins if addr in self._layout)
         space = self._spaces[self._active]
         while stack:
             addr = stack.pop()

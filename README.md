@@ -1,9 +1,10 @@
 # moving_gc — 带弱引用的移动式垃圾回收内核（可复用教学模块）
 
 一个从零实现、仅依赖标准库的**半空间（semi-space）移动式垃圾回收器**模拟内核，
-支持强边 / 弱边、整数 payload、显式根、基于 epoch 的外部 handle 失效检测。
-它是一个有限契约的教学/实验模型，**不宣称**与任何行业标准运行时（JVM、.NET、
-V8 等）的内存管理兼容。
+支持强边 / 弱边、整数 payload、显式根、基于 epoch 的外部 handle 失效检测，
+以及可选的 **pinning 模式**（外部代码经 pin 句柄钉住对象，回收器在固定对象
+之间滑动压缩可移动对象）。它是一个有限契约的教学/实验模型，**不宣称**与任何
+行业标准运行时（JVM、.NET、V8 等）的内存管理兼容。
 
 ## Python 版本与依赖
 
@@ -12,13 +13,25 @@ V8 等）的内存管理兼容。
 - 完全离线：不访问网络、账号、密钥、数据库、中间件、云 API、Docker 或硬件
 - 示例数据全部由仓库内确定性代码生成（固定图 + 固定随机种子的差分测试）
 
+## 环境准备（venv）
+
+仓库根目录的 `.venv` 是指向已备好解释器的符号链接；如需自行重建：
+
+```bash
+python3.14 -m venv .venv        # 任何 3.10+ 解释器即可，目标版本 3.14.7
+# 无需 pip install：仅标准库，requirements.txt 为空说明
+```
+
 ## 运行命令
 
 ```bash
 # 必要测试（unittest 标准发现）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（实测约 0.03 秒，远小于 8 秒；无 sleep、无预录输出）
+# pinning 模式演示（现场计算，实测约 0.03 秒，远小于 90 秒；无 sleep、无预录输出）
+python demo_iteration.py
+
+# 原有 Cheney 模式固定输入演示（同样现场计算）
 python demo.py
 ```
 
@@ -26,8 +39,8 @@ python demo.py
 
 ```python
 from moving_gc import (
-    Heap, Handle, CollectionResult,
-    GCError, StaleHandleError, HeapCapacityError,
+    Heap, Handle, PinHandle, CollectionResult,
+    GCError, StaleHandleError, HeapCapacityError, FragmentationError,
     MAX_CAPACITY,   # 4096
 )
 ```
@@ -38,6 +51,15 @@ from moving_gc import (
 epoch。handle 不可变；每次成功 `collect()` 后堆 epoch +1，**所有旧 handle
 立即失效**，即使对象搬迁后恰好落在同一槽号（地址相同也拒绝）。
 
+### `PinHandle(address: int, generation: int)`（frozen dataclass，仅 pinning 模式）
+
+外部代码持有的**稳定逻辑槽地址**句柄。`generation` 是每次 `pin()` 递增的
+独立序号，与堆 epoch 无关。pin 期间对象是强根且绝不搬动；同一对象可重复
+pin，按次数分别计数，释放一个句柄不解除其余固定引用。句柄释放后其
+generation 立即作废：旧 pin 句柄无法操作后来复用同一地址的新对象
+（`StaleHandleError`）。这只是逻辑槽地址稳定，**不是**承诺 Python 对象的
+真实内存地址不变。
+
 ### `CollectionResult`（frozen dataclass）
 
 | 字段 | 含义 |
@@ -46,10 +68,13 @@ epoch。handle 不可变；每次成功 `collect()` 后堆 epoch +1，**所有�
 | `live_slots: int` | 回收后活动半空间中存活对象占用的槽数（= 新 bump 指针） |
 | `cleared_weak_edges: tuple[(holder_addr, field_idx), ...]` | 目标已死、被清空为 `None` 的弱边；holder 地址为**回收后**地址，按持有者地址、字段号排序 |
 | `roots_preserved: int` | 非空（被更新）的显式根数量 |
+| `pinned_addresses: tuple[int,...]` | 本次回收中被钉住未动的地址（仅 pinning 模式，否则为空元组） |
 
-### `Heap(capacity: int)`
+### `Heap(capacity: int, *, pinning: bool = False)`
 
 半空间容量以**槽**计，`1 <= capacity <= 4096`（`MAX_CAPACITY`）。
+`pinning=True` 启用 pinning 模式（见下节）；默认 `False`，行为与原版
+Cheney 复制完全一致（复制顺序、Handle 的 epoch 失效规则均不变）。
 
 | 方法 | 语义 |
 |---|---|
@@ -67,6 +92,34 @@ epoch。handle 不可变；每次成功 `collect()` 后堆 epoch +1，**所有�
 | `capacity / epoch / used_slots / free_slots` | 只读属性 |
 | `objects() -> tuple[int,...]` | 当前全部对象头地址 |
 | `reachable_addresses() -> frozenset[int]` | 只读的独立强可达遍历（诊断/测试用，不复制） |
+
+pinning 模式追加的方法（`pinning` 只读属性返回是否启用）：
+
+| 方法 | 语义 |
+|---|---|
+| `pin(handle) -> PinHandle` | 钉住对象；每次调用独立计数。非 pinning 堆调用抛 `GCError` |
+| `release(pin_handle)` | 释放一个 pin；已释放/伪造的句柄抛 `StaleHandleError`，非 PinHandle 抛 `TypeError` |
+| `pin_count(address) -> int` | 该地址当前未释放的 pin 数 |
+| `pinned_addresses() -> tuple[int,...]` | 全部被钉住地址（升序） |
+
+所有字段读写方法（`payload`/`set_payload`/`get_strong`/`set_strong`/`get_weak`/`set_weak`/`object_shape`）同时接受 `Handle` 与 `PinHandle`。
+
+## pinning 模式（本题增量）
+
+- **回收算法**：原地滑动压缩（mark-compact 风格），不做半空间翻转。
+  可达性从显式根**和所有被 pin 的地址**出发、只沿强边；被钉住的对象
+  保持原槽位，可移动存活对象按地址顺序滑入不被固定对象覆盖的最低
+  空闲槽。普通指针与弱引用照常按转发表修正，死亡弱目标清空——
+  不会退化为整堆不移动。
+- **分配**：自由区间首次适配（first-fit）。装不下时仍**先自动回收恰好
+  一次**再判定；回收后总空闲足够但没有连续槽时抛
+  `FragmentationError`（`HeapCapacityError` 子类，消息注明碎片化），
+  总空闲也不足时抛普通 `HeapCapacityError`，对象大于整个半空间同样
+  报容量错误。失败绝不留下半对象。
+- **Handle 规则不变**：每次成功回收 epoch 仍 +1，回收前签发的普通
+  `Handle` 一律失效；只有 `PinHandle` 凭独立世代跨回收有效。
+- `CollectionResult.relocated` 在 pinning 模式下只包含**实际移动**的
+  对象（未动的不列出），`pinned_addresses` 给出本次被钉住的地址。
 
 ## 回收算法（契约）
 
@@ -137,6 +190,9 @@ epoch。handle 不可变；每次成功 `collect()` 后堆 epoch +1，**所有�
   无 finalizer、无软/虚引用、无弱根。
 - 句柄需由调用者在每次回收后主动重新获取（如经根），不提供自动更新的
   间接句柄表。
+- pinning 模式是原地压缩的教学模型：pin 只保证逻辑槽地址稳定，不承诺
+  Python 对象真实内存地址不变；分配为首次适配，长期交错分配/释放仍可能
+  碎片化（此时如实抛 `FragmentationError`，不做整理式重试）。
 - 非线程安全（单线程教学模型）。
 - 不保证 Python 进程内存与“槽数”线性对应；4096 槽是模拟堆的逻辑边界。
 
@@ -145,12 +201,14 @@ epoch。handle 不可变；每次成功 `collect()` 后堆 epoch +1，**所有�
 ```
 moving_gc/
   __init__.py        # 公开接口导出
-  core.py            # Heap / Handle / CollectionResult + Cheney 回收
-  errors.py          # GCError / StaleHandleError / HeapCapacityError
+  core.py            # Heap / Handle / PinHandle / CollectionResult + Cheney 回收 + pinning 压缩
+  errors.py          # GCError / StaleHandleError / HeapCapacityError / FragmentationError
 tests/
   reference.py       # 独立参考模型（不导入 moving_gc）
   test_moving_gc.py  # 28 个用例：场景对照、边界、输入校验、种子化差分 fuzz
+  test_pinning.py    # 13 个用例：pinning 契约、独立压缩模型对照、碎片化与异常路径
 demo.py              # 固定输入演示：搬迁 + 弱边清空 + 两类实际触发的错误
+demo_iteration.py    # pinning 模式演示：压缩、重复 pin、旧 pin 句柄拒绝、碎片化失败
 README.md
 ```
 
@@ -166,3 +224,9 @@ README.md
 - 输入校验：`bool`/NaN/Infinity/浮点/字符串、负边数、索引越界、根名非法、
   原子性（失败根替换保留旧根、空根/注销）。
 - 12 组固定种子随机图的两轮回收差分测试（含回收间删根、新分配、改边）。
+- pinning：固定对象夹住空洞时压缩可移动对象、重复 pin 分别计数、先释放
+  一层 pin 再回收、弱引用指向固定对象、释放后旧 pin 句柄不得操作复用地址
+  的新对象、总空闲足够但无连续槽报 `FragmentationError`、未开启 pinning
+  时 `pin()` 报错、普通 Handle 的 epoch 失效规则在两种模式下均保持；
+  每步校验槽区间不重叠、可达性与固定地址不变（期望值来自测试内独立的
+  滑动压缩模型，不调用被测核心）。
