@@ -18,8 +18,22 @@ V8 等）的内存管理兼容。
 # 必要测试（unittest 标准发现）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（实测约 0.03 秒，远小于 8 秒；无 sleep、无预录输出）
+# 基线半空间演示（实测毫秒级；无 sleep、无预录输出）
 python demo.py
+
+# 本轮增量：可选 pinning 模式演示（实测毫秒级，远小于 90 秒）
+python demo_iteration.py
+```
+
+建议在 Linux 原生 Python 3.14.7 的 venv 中运行（仅标准库，无需联网安装
+任何第三方包）：
+
+```bash
+python3.14 -m venv .venv
+source .venv/bin/activate
+python --version        # Python 3.14.7
+python -m unittest discover -s tests -v
+python demo_iteration.py
 ```
 
 ## 公开数据结构与接口
@@ -28,9 +42,48 @@ python demo.py
 from moving_gc import (
     Heap, Handle, CollectionResult,
     GCError, StaleHandleError, HeapCapacityError,
+    PinHandle, StalePinHandleError, FragmentationError,
     MAX_CAPACITY,   # 4096
 )
 ```
+
+### 可选 pinning 模式（本轮增量）
+
+`Heap(capacity, pinning=True)` 开启固定模式（默认 `False`，关闭时行为与
+基线完全一致）。
+
+| 接口 | 语义 |
+|---|---|
+| `pin(handle) -> PinHandle` | 固定目标对象于其当前**逻辑槽地址**，返回独立 pin 句柄；pin 同时是强根（无显式根也存活）。可对同一对象重复 pin，每个句柄独立计数 |
+| `unpin(pin_handle)` | 释放恰好一个 pin 句柄；同一对象被 pin 多次时，释放一个不影响其余固定引用 |
+| `pinned_addresses() -> frozenset[int]` | 当前至少被一个句柄固定的对象头地址（诊断用） |
+| `heap.pinning` | 是否为固定模式（只读 bool） |
+
+`PinHandle(address, pin_id)` 是与普通 `Handle` **独立的世代**：`pin_id`
+是堆内单调递增、从不复用的 pin 代号。pin 句柄在其 pin 存活期间跨回收
+持续有效（不随 epoch 失效）；一旦释放，旧句柄立即失效——即使后续新对象
+复用了同一槽地址，旧句柄的任何操作都必须抛 `StalePinHandleError`
+（`StaleHandleError` 子类），不可能误伤新对象。
+
+注意：pinning 模拟的是**逻辑槽地址稳定**，用于教学外部代码持有稳定地址
+的场景；它**不承诺**真实 Python 对象的物理内存地址不变。
+
+**固定模式的回收语义**（`collect()` 在 pinning 模式下）：
+
+1. 可达性从显式根**和所有 pin**出发、只沿强边计算；弱边仍不保持存活。
+2. 固定对象保留在原槽区间，**绝不搬迁**；其余可达对象在固定对象之间的
+   空洞中做 first-fit 压缩，顺序确定（按旧地址升序）。普通指针、根和指向
+   存活者的弱引用照常改址；指向死亡对象的弱边清空。不会退化为“整堆不
+   移动”。
+3. 固定模式下分配同样采用空洞 first-fit；空间不够时仍先自动回收恰好一次。
+   回收后：总空闲槽足够但没有连续空洞能容纳新对象时，抛
+   `FragmentationError`（`HeapCapacityError` 子类）；总空闲本身不足则仍抛
+   `HeapCapacityError`。失败不留半对象、不动任何固定对象。
+4. 回收仍是全有或全无：在备用半空间构造新布局（固定对象复制到相同下标），
+   成功后翻转并 epoch +1；中途失败则清空备用半空间、原堆可观察状态不变。
+
+`CollectionResult.relocated` 在固定模式下只包含真正搬了槽的可移动对象；
+`live_slots` 为全部存活对象占用的槽数之和。
 
 ### `Handle(address: int, epoch: int)`（frozen dataclass）
 
@@ -137,6 +190,10 @@ epoch。handle 不可变；每次成功 `collect()` 后堆 epoch +1，**所有�
   无 finalizer、无软/虚引用、无弱根。
 - 句柄需由调用者在每次回收后主动重新获取（如经根），不提供自动更新的
   间接句柄表。
+- pinning 模式固定的是本模型的逻辑槽下标，不是 Python 进程内对象的物理
+  地址；固定对象之间的压缩采用简单 first-fit（按旧地址升序放置），不做
+  最优装箱、不移动固定对象，因此固定对象布局长期不变时碎片化可能累积，
+  此时按契约报告 `FragmentationError`。
 - 非线程安全（单线程教学模型）。
 - 不保证 Python 进程内存与“槽数”线性对应；4096 槽是模拟堆的逻辑边界。
 
@@ -146,11 +203,14 @@ epoch。handle 不可变；每次成功 `collect()` 后堆 epoch +1，**所有�
 moving_gc/
   __init__.py        # 公开接口导出
   core.py            # Heap / Handle / CollectionResult + Cheney 回收
-  errors.py          # GCError / StaleHandleError / HeapCapacityError
+  errors.py          # GCError / StaleHandleError / HeapCapacityError /
+                     # StalePinHandleError / FragmentationError
 tests/
   reference.py       # 独立参考模型（不导入 moving_gc）
-  test_moving_gc.py  # 28 个用例：场景对照、边界、输入校验、种子化差分 fuzz
-demo.py              # 固定输入演示：搬迁 + 弱边清空 + 两类实际触发的错误
+  test_moving_gc.py  # 基线 28 个用例：场景对照、边界、输入校验、差分 fuzz
+  test_pinning.py    # pinning 增量用例（独立计数、世代、碎片化等）
+demo.py              # 基线演示：搬迁 + 弱边清空 + 两类实际触发的错误
+demo_iteration.py    # pinning 演示：夹洞压缩、独立 pin、世代、碎片化
 README.md
 ```
 
