@@ -27,6 +27,7 @@ python demo.py
 ```python
 from moving_gc import (
     Heap, Handle, CollectionResult,
+    WeakClearNotification,
     GCError, StaleHandleError, HeapCapacityError,
     MAX_CAPACITY,   # 4096
 )
@@ -47,6 +48,17 @@ epoch。handle 不可变；每次成功 `collect()` 后堆 epoch +1，**所有�
 | `cleared_weak_edges: tuple[(holder_addr, field_idx), ...]` | 目标已死、被清空为 `None` 的弱边；holder 地址为**回收后**地址，按持有者地址、字段号排序 |
 | `roots_preserved: int` | 非空（被更新）的显式根数量 |
 
+### `WeakClearNotification`（frozen dataclass）
+
+| 字段 | 含义 |
+|---|---|
+| `holder: Handle` | 被清空弱字段所属对象在**成功回收后**的新 handle |
+| `index: int` | 被清空的弱字段编号 |
+
+通知只记录持有者和字段，不记录死亡目标地址，因此通知自身不可能通过该记录
+重新保活目标；`holder` 也只是普通 handle，不会注册为根。若持有者之后死亡，
+已领取通知中的 handle 会按正常 epoch 规则变陈旧。
+
 ### `Heap(capacity: int)`
 
 半空间容量以**槽**计，`1 <= capacity <= 4096`（`MAX_CAPACITY`）。
@@ -64,7 +76,9 @@ epoch。handle 不可变；每次成功 `collect()` 后堆 epoch +1，**所有�
 | `object_shape(h) -> (n_strong, n_weak)` | 对象边数 |
 | `handle(address) -> Handle` | 为当前存活于该地址的对象签发 handle；无对象抛 `StaleHandleError` |
 | `collect() -> CollectionResult` | 执行一次回收（见下） |
+| `claim_weak_clear_notifications() -> tuple[WeakClearNotification, ...]` | 一次性领取并清空全部待领弱引用清空通知；无待领记录时返回空元组 |
 | `capacity / epoch / used_slots / free_slots` | 只读属性 |
+| `pending_weak_clear_notifications: int` | 当前尚未领取的弱引用清空通知数量 |
 | `objects() -> tuple[int,...]` | 当前全部对象头地址 |
 | `reachable_addresses() -> frozenset[int]` | 只读的独立强可达遍历（诊断/测试用，不复制） |
 
@@ -78,7 +92,11 @@ epoch。handle 不可变；每次成功 `collect()` 后堆 epoch +1，**所有�
 3. **转发放置**：根、全部强边、以及指向存活目标的弱边改写到新地址；
    指向死亡目标的弱边清空为 `None`。
 4. 成功后翻转活动半空间、压缩存活对象到低端、epoch +1。
-5. 无 finalizer。
+5. 每次真正清空弱边时发布一条可领取通知；显式空边、指向存活者并被转发的
+   弱边不发布。通知按成功回收批次、持有者新地址、字段号组成 FIFO 顺序，
+   领取后移除；字段之后被重新设置时，可在下一次真正清空时再次通知。
+6. 通知只在回收成功提交后发布；回收失败不会发布部分通知。
+7. 无 finalizer。
 
 复制期间使用独立的转发表字典（对象头槽在本模型中保留但不存转发指针）。
 回收是**全有或全无**的：若存活集在复制途中确认装不进半空间（在源空间本身
@@ -121,6 +139,9 @@ epoch。handle 不可变；每次成功 `collect()` 后堆 epoch +1，**所有�
   天然覆盖“地址巧合相同”的陈旧引用；无单独的 remembered set / 卡表。
 - **弱边在强闭包复制完成后一次性修正**，顺序确定（持有者新地址升序、
   字段号升序），因此清空列表可直接作为输出回归对照。
+- **通知队列独立于堆图**：队列只保存持有者的不可变 handle/字段编号，不把
+  任何通知对象加入根集合，也不保存死亡目标；因此领取前保存通知不会影响
+  GC 可达性。
 - **自动应急回收仅一次**：`allocate` 空间不足时触发恰好一次 `collect()`，
   不循环重试，避免“分配触发多次 GC”的不可预测停顿。
 - **独立参考实现**（`tests/reference.py`）不导入被测包，用自带的命名图 +
@@ -133,8 +154,9 @@ epoch。handle 不可变；每次成功 `collect()` 后堆 epoch +1，**所有�
 - 单“代”、stop-the-world、非增量、非并发、非并行；无写屏障、read barrier、
    remembered set；内部槽访问在真实实现中应是裸内存读写，本模型为
   Python 列表，访问是 O(1) 但有解释器开销。
-- 弱边清空后无法区分“原本为空”与“被 GC 清空”；无弱引用通知队列、
-  无 finalizer、无软/虚引用、无弱根。
+- 直接读取弱边仍只返回 `Handle | None`，不会因为存在通知而改变弱边值；
+  历史“原本为空还是被清空”的区分需调用者及时领取通知。无 finalizer、
+  无软/虚引用、无弱根。
 - 句柄需由调用者在每次回收后主动重新获取（如经根），不提供自动更新的
   间接句柄表。
 - 非线程安全（单线程教学模型）。
@@ -145,11 +167,11 @@ epoch。handle 不可变；每次成功 `collect()` 后堆 epoch +1，**所有�
 ```
 moving_gc/
   __init__.py        # 公开接口导出
-  core.py            # Heap / Handle / CollectionResult + Cheney 回收
+  core.py            # Heap / Handle / CollectionResult + 弱引用清空通知
   errors.py          # GCError / StaleHandleError / HeapCapacityError
 tests/
   reference.py       # 独立参考模型（不导入 moving_gc）
-  test_moving_gc.py  # 28 个用例：场景对照、边界、输入校验、种子化差分 fuzz
+  test_moving_gc.py  # 34 个用例：场景对照、通知、边界、输入校验、fuzz
 demo.py              # 固定输入演示：搬迁 + 弱边清空 + 两类实际触发的错误
 README.md
 ```
@@ -159,6 +181,8 @@ README.md
 - 与独立参考实现对照：自环、无根环（全死）、仅弱引用（清空）、多弱边同死
   目标、共享子图（只复制一次）、弱边指向存活者（改址）、根/字段复制顺序、
   强弱混合菱形。
+- 弱引用通知：领取即移除、空边和存活转发不通知、重新设置后再次通知、
+  FIFO 跨回收顺序、通知不保活对象、失败回收不发布。
 - 边界：4096 槽刚好满堆回收后再分配失败、小堆满后失败无半对象、单对象超容、
   分配失败触发回收后成功、容量构造边界。
 - 旧 handle：epoch 不符即拒绝（含地址恰好相同、伪造当前 epoch 空地址）、

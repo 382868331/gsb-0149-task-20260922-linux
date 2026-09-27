@@ -42,6 +42,7 @@ __all__ = [
     "Heap",
     "Handle",
     "CollectionResult",
+    "WeakClearNotification",
     "GCError",
     "StaleHandleError",
     "HeapCapacityError",
@@ -113,6 +114,22 @@ class CollectionResult:
     roots_preserved: int = 0
 
 
+@dataclass(frozen=True)
+class WeakClearNotification:
+    """A claimable record that one weak edge was cleared by collection.
+
+    Attributes:
+        holder: handle for the object containing the cleared weak field,
+            minted at the successful collection's new epoch.  It is an
+            ordinary immutable handle and is never registered as a root,
+            so retaining this notification cannot keep ``holder`` alive.
+        index: weak-field index on ``holder``.
+    """
+
+    holder: Handle
+    index: int
+
+
 class Heap:
     """Semi-space heap with strong/weak edges and explicit roots.
 
@@ -146,6 +163,8 @@ class Heap:
         self._roots: dict[str, int | None] = {}
         # Root insertion order (Python dict preserves it, but be explicit).
         self._root_order: list[str] = []
+        # FIFO weak-clear notifications published only by committed GCs.
+        self._weak_clear_notifications: list[WeakClearNotification] = []
 
     # ------------------------------------------------------------------ #
     # Introspection
@@ -173,6 +192,24 @@ class Heap:
     def objects(self) -> tuple[int, ...]:
         """Addresses (header slots) of all objects currently in the heap."""
         return tuple(sorted(self._layout))
+
+    @property
+    def pending_weak_clear_notifications(self) -> int:
+        """Number of published weak-clear notifications not yet claimed."""
+        return len(self._weak_clear_notifications)
+
+    def claim_weak_clear_notifications(self) -> tuple[WeakClearNotification, ...]:
+        """Claim and remove all pending weak-clear notifications.
+
+        Notifications are returned in publication order: successful
+        collection order, then post-collection holder address and weak
+        field order.  Claiming does not trace or retain heap objects: the
+        handles in returned records are ordinary values and never act as
+        roots.
+        """
+        pending = tuple(self._weak_clear_notifications)
+        self._weak_clear_notifications.clear()
+        return pending
 
     # ------------------------------------------------------------------ #
     # Allocation
@@ -481,6 +518,13 @@ class Heap:
         self._layout = new_layout
         self._roots = new_roots
         self._epoch += 1
+
+        # Publication is after commit: a failed collection leaves any older
+        # pending notifications untouched and publishes no partial result.
+        self._weak_clear_notifications.extend(
+            WeakClearNotification(Handle(holder, self._epoch), index)
+            for holder, index in cleared
+        )
 
         return CollectionResult(
             relocated=relocated,

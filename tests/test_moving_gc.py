@@ -20,6 +20,7 @@ from reference import GraphSpec  # noqa: E402  (independent oracle)
 from moving_gc import (  # noqa: E402
     MAX_CAPACITY,
     Handle,
+    WeakClearNotification,
     Heap,
     HeapCapacityError,
     StaleHandleError,
@@ -314,6 +315,126 @@ class TestGraphScenarios(unittest.TestCase):
         self.assertIsNone(heap.get_weak(fresh["a"], 0))
         self.assertEqual(heap.get_weak(fresh["a"], 1), fresh["s"])
         self.assertIsNone(heap.get_weak(fresh["b"], 0))
+
+
+class TestWeakClearNotifications(unittest.TestCase):
+    def test_notification_identifies_edge_and_claim_removes_it(self):
+        heap = Heap(16)
+        holder = heap.allocate(1, n_weak=1)
+        target = heap.allocate(2)
+        heap.set_weak(holder, 0, target)
+        heap.add_root("holder", holder)
+
+        self.assertEqual(heap.claim_weak_clear_notifications(), ())
+        result = heap.collect()
+
+        fresh_holder = heap.handle(result.cleared_weak_edges[0][0])
+        self.assertEqual(heap.pending_weak_clear_notifications, 1)
+        notifications = heap.claim_weak_clear_notifications()
+        self.assertEqual(
+            notifications,
+            (WeakClearNotification(fresh_holder, 0),),
+        )
+        self.assertEqual(heap.pending_weak_clear_notifications, 0)
+        self.assertEqual(heap.claim_weak_clear_notifications(), ())
+
+    def test_explicit_null_and_forwarded_weak_edges_do_not_notify(self):
+        heap = Heap(20)
+        holder = heap.allocate(1, n_weak=2)
+        survivor = heap.allocate(2)
+        heap.set_weak(holder, 1, survivor)
+        heap.add_root("holder", holder)
+        heap.add_root("survivor", survivor)
+
+        heap.collect()
+
+        self.assertEqual(heap.claim_weak_clear_notifications(), ())
+
+    def test_reset_edge_notifies_again_but_cleared_null_does_not(self):
+        heap = Heap(20)
+        holder = heap.allocate(1, n_weak=1)
+        first_target = heap.allocate(2)
+        heap.set_weak(holder, 0, first_target)
+        heap.add_root("holder", holder)
+
+        first = heap.collect()
+        first_notice = heap.claim_weak_clear_notifications()
+        self.assertEqual(len(first_notice), 1)
+        self.assertEqual(first_notice[0].index, 0)
+
+        heap.collect()
+        self.assertEqual(heap.claim_weak_clear_notifications(), ())
+        fresh_holder = heap.root_handle("holder")
+
+        second_target = heap.allocate(3)
+        heap.set_weak(fresh_holder, 0, second_target)
+        second = heap.collect()
+        notifications = heap.claim_weak_clear_notifications()
+
+        self.assertEqual(second.cleared_weak_edges, ((0, 0),))
+        self.assertEqual(len(notifications), 1)
+        self.assertEqual(notifications[0], WeakClearNotification(heap.handle(0), 0))
+
+    def test_notifications_preserve_fifo_order_across_collections(self):
+        heap = Heap(32)
+        first = heap.allocate(1, n_weak=1)
+        dead_one = heap.allocate(2)
+        heap.set_weak(first, 0, dead_one)
+        heap.add_root("first", first)
+        heap.collect()
+
+        fresh_first = heap.handle(0)
+        heap.remove_root("first")
+        second = heap.allocate(3, n_weak=2)
+        third = heap.allocate(4, n_weak=1)
+        dead_two = heap.allocate(5)
+        dead_three = heap.allocate(6)
+        heap.set_weak(second, 0, fresh_first)
+        heap.set_weak(second, 1, dead_two)
+        heap.set_weak(third, 0, dead_three)
+        heap.add_root("second", second)
+        heap.add_root("third", third)
+        heap.collect()
+
+        notifications = heap.claim_weak_clear_notifications()
+
+        self.assertEqual(
+            [(notice.holder.address, notice.index) for notice in notifications],
+            [(0, 0), (0, 0), (0, 1), (4, 0)],
+        )
+
+    def test_retained_notification_does_not_keep_holder_alive(self):
+        heap = Heap(16)
+        holder = heap.allocate(1, n_weak=1)
+        target = heap.allocate(2)
+        heap.set_weak(holder, 0, target)
+        heap.add_root("holder", holder)
+        heap.collect()
+
+        notifications = heap.claim_weak_clear_notifications()
+        stale_holder = notifications[0].holder
+        heap.clear_root("holder")
+        heap.collect()
+
+        self.assertEqual(heap.objects(), ())
+        with self.assertRaises(StaleHandleError):
+            heap.payload(stale_holder)
+
+    def test_failed_collection_publishes_no_notifications(self):
+        heap = Heap(16)
+        holder = heap.allocate(1, n_weak=1)
+        target = heap.allocate(2)
+        heap.set_weak(holder, 0, target)
+        heap.add_root("holder", holder)
+        heap._capacity = 1
+
+        with self.assertRaises(HeapCapacityError):
+            heap.collect()
+
+        heap._capacity = 16
+        self.assertEqual(heap.epoch, 0)
+        self.assertEqual(heap.pending_weak_clear_notifications, 0)
+        self.assertEqual(heap.objects(), (0, 3))
 
 
 # --------------------------------------------------------------------------- #

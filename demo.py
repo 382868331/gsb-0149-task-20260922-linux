@@ -76,6 +76,8 @@ def main() -> None:
     print(f"  live_slots:            {result.live_slots}")
     print(f"  roots preserved:       {result.roots_preserved}")
     print(f"  cleared weak edges:    {list(result.cleared_weak_edges)}")
+    notices = heap.claim_weak_clear_notifications()
+    print(f"  claimable notices:     {[(n.holder.address, n.index) for n in notices]}")
 
     h = heap.root_handle("main")
     strong_child = heap.get_strong(h, 0)
@@ -94,6 +96,8 @@ def main() -> None:
 
     moved = h.address != before["holder"] and strong_child.address != before["child"]
     assert moved and weak_cache is None, "demo invariant failed"
+    assert notices and notices[0].holder == h and notices[0].index == 0
+    assert heap.claim_weak_clear_notifications() == ()
     print("  >> addresses really changed and the dead weak edge was cleared.")
 
     # ------------------------------------------------------------------ #

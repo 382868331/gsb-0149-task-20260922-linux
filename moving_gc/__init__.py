@@ -2,7 +2,7 @@
 
 Public surface::
 
-    from moving_gc import Heap, Handle, CollectionResult
+    from moving_gc import Heap, Handle, CollectionResult, WeakClearNotification
     from moving_gc import GCError, StaleHandleError, HeapCapacityError
     from moving_gc import MAX_CAPACITY
 
@@ -16,6 +16,7 @@ from .core import (
     CollectionResult,
     Handle,
     Heap,
+    WeakClearNotification,
 )
 from .errors import GCError, HeapCapacityError, StaleHandleError
 
@@ -23,6 +24,7 @@ __all__ = [
     "Heap",
     "Handle",
     "CollectionResult",
+    "WeakClearNotification",
     "GCError",
     "StaleHandleError",
     "HeapCapacityError",
