@@ -26,6 +26,8 @@ each root's object copied immediately, then strong edges are processed in
 field order by a Cheney scan.  Weak edges never keep a target alive.  After
 the strong closure is evacuated, weak edges are rewritten: surviving
 targets point at the new address, dead targets are cleared to ``None``.
+Each committed clearing also publishes one claimable notice identifying
+the surviving holder, weak-field index and the dead target's old handle.
 
 The module only implements the finite contract described in README.md; it
 is not a drop-in replacement for any production runtime GC.
@@ -42,6 +44,7 @@ __all__ = [
     "Heap",
     "Handle",
     "CollectionResult",
+    "WeakClearNotice",
     "GCError",
     "StaleHandleError",
     "HeapCapacityError",
@@ -113,6 +116,25 @@ class CollectionResult:
     roots_preserved: int = 0
 
 
+@dataclass(frozen=True)
+class WeakClearNotice:
+    """A weak edge that was cleared by a successfully committed collection.
+
+    Attributes:
+        holder: handle for the object containing the weak edge, minted in
+            the epoch after the clearing collection.  Notices are not
+            roots and do not keep this object alive.
+        field_index: weak-field index on ``holder``.
+        former_target: last handle the edge named before collection.  The
+            handle is stale after the successful collection; it records
+            identity rather than granting access to the reclaimed object.
+    """
+
+    holder: Handle
+    field_index: int
+    former_target: Handle
+
+
 class Heap:
     """Semi-space heap with strong/weak edges and explicit roots.
 
@@ -146,6 +168,12 @@ class Heap:
         self._roots: dict[str, int | None] = {}
         # Root insertion order (Python dict preserves it, but be explicit).
         self._root_order: list[str] = []
+        # Weak edges that currently name a target and may therefore notify
+        # on a future GC clearing.  Keys are (active-space address, index).
+        # Published notices remove the key, so repeated null-edge
+        # collections do not notify again until set_weak() arms the field.
+        self._armed_weak_edges: set[tuple[int, int]] = set()
+        self._weak_clear_notices: list[WeakClearNotice] = []
 
     # ------------------------------------------------------------------ #
     # Introspection
@@ -173,6 +201,12 @@ class Heap:
     def objects(self) -> tuple[int, ...]:
         """Addresses (header slots) of all objects currently in the heap."""
         return tuple(sorted(self._layout))
+
+    def take_weak_clear_notices(self) -> tuple[WeakClearNotice, ...]:
+        """Claim and remove all pending weak-edge clearing notices."""
+        notices = tuple(self._weak_clear_notices)
+        self._weak_clear_notices.clear()
+        return notices
 
     # ------------------------------------------------------------------ #
     # Allocation
@@ -234,6 +268,8 @@ class Heap:
         # but set them explicitly so reused to-space slots are well-defined.
         for i in range(2, size):
             space[addr + i] = None
+            if i - 2 >= n_strong:
+                self._armed_weak_edges.discard((addr, i - 2 - n_strong))
         self._alloc_ptr = addr + size
         self._layout[addr] = (n_strong, n_weak)
         return Handle(addr, self._epoch)
@@ -336,9 +372,8 @@ class Heap:
         """Read weak edge ``index``.
 
         ``None`` is returned both for an explicitly null edge and for an
-        edge whose target was reclaimed by the most recent collection;
-        callers cannot distinguish the two (standard weak-reference
-        semantics).
+        edge whose target was reclaimed.  Use
+        :meth:`take_weak_clear_notices` to distinguish the latter event.
         """
         addr = self._resolve(target)
         n_strong, n_weak = self._layout[addr]
@@ -355,7 +390,13 @@ class Heap:
         n_strong, n_weak = self._layout[addr]
         self._check_index(index, n_weak, "weak")
         new_val = None if ref is None else self._resolve(ref)
-        self._spaces[self._active][addr + 2 + n_strong + index] = new_val
+        slot_address = addr + 2 + n_strong + index
+        self._spaces[self._active][slot_address] = new_val
+        key = (addr, index)
+        if new_val is None:
+            self._armed_weak_edges.discard(key)
+        else:
+            self._armed_weak_edges.add(key)
 
     @staticmethod
     def _check_index(index: int, length: int, kind: str) -> None:
@@ -398,10 +439,13 @@ class Heap:
         # mark set (an object is copied iff it appears here).
         fwd: dict[int, int] = {}
         new_layout: dict[int, tuple[int, int]] = {}
+        copied_from: dict[int, int] = {}
         scan = 0  # Cheney scan cursor over *destination* addresses
         free = 0  # bump pointer in destination
         relocated: dict[int, int] = {}
         new_roots: dict[str, int | None] = {}
+        armed_weak_edges = self._armed_weak_edges
+        new_armed_weak_edges: set[tuple[int, int]] = set()
         roots_preserved = 0
 
         def copy_obj(old: int) -> int:
@@ -420,6 +464,7 @@ class Heap:
             # Blind bulk copy of the slot window, then fix up fields below.
             dst[new : new + size] = src[old : old + size]
             fwd[old] = new
+            copied_from[new] = old
             new_layout[new] = (n_strong, n_weak)
             relocated[old] = new
             return new
@@ -447,10 +492,23 @@ class Heap:
 
             live_slots = free
 
+            # Translate armed weak edges belonging to surviving holders.
+            # Dead holders take their armed state with them; edges to dead
+            # targets are disarmed by the fix-up loop below.
+            for old_holder, field_index in armed_weak_edges:
+                copied_holder = fwd.get(old_holder)
+                if copied_holder is None:
+                    continue
+                n_strong, _ = new_layout[copied_holder]
+                old_target = dst[copied_holder + 2 + n_strong + field_index]
+                if old_target in fwd:
+                    new_armed_weak_edges.add((copied_holder, field_index))
+
             # Phase 3: fix weak edges of survivors.  Weak targets never became
             # part of the closure, so they are either in fwd (alive elsewhere)
             # or unreachable -> clear.
             cleared: list[tuple[int, int]] = []
+            notices: list[WeakClearNotice] = []
             for new in sorted(new_layout):
                 n_strong, n_weak = new_layout[new]
                 weak_base = new + 2 + n_strong
@@ -461,8 +519,17 @@ class Heap:
                     if old_target in fwd:
                         dst[weak_base + j] = fwd[old_target]
                     else:
+                        was_armed = (copied_from[new], j) in armed_weak_edges
                         dst[weak_base + j] = None
                         cleared.append((new, j))
+                        if was_armed:
+                            notices.append(
+                                WeakClearNotice(
+                                    holder=Handle(new, self._epoch + 1),
+                                    field_index=j,
+                                    former_target=Handle(old_target, self._epoch),
+                                )
+                            )
         except HeapCapacityError:
             # All-or-nothing: erase the partial evacuation so no half-built
             # state is observable (the heap still serves from src).  The
@@ -480,6 +547,8 @@ class Heap:
         self._alloc_ptr = live_slots
         self._layout = new_layout
         self._roots = new_roots
+        self._armed_weak_edges = new_armed_weak_edges
+        self._weak_clear_notices.extend(notices)
         self._epoch += 1
 
         return CollectionResult(

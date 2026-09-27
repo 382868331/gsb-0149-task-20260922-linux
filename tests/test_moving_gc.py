@@ -23,6 +23,7 @@ from moving_gc import (  # noqa: E402
     Heap,
     HeapCapacityError,
     StaleHandleError,
+    WeakClearNotice,
 )
 
 
@@ -314,6 +315,93 @@ class TestGraphScenarios(unittest.TestCase):
         self.assertIsNone(heap.get_weak(fresh["a"], 0))
         self.assertEqual(heap.get_weak(fresh["a"], 1), fresh["s"])
         self.assertIsNone(heap.get_weak(fresh["b"], 0))
+
+
+class TestWeakClearNotices(unittest.TestCase):
+    def test_notice_identifies_holder_field_and_former_target(self):
+        heap = Heap(20)
+        holder = heap.allocate(1, n_weak=1)
+        target = heap.allocate(2)
+        heap.set_weak(holder, 0, target)
+        heap.add_root("holder", holder)
+
+        result = heap.collect()
+
+        self.assertEqual(result.cleared_weak_edges, ((0, 0),))
+        notices = heap.take_weak_clear_notices()
+        self.assertEqual(len(notices), 1)
+        notice = notices[0]
+        self.assertIsInstance(notice, WeakClearNotice)
+        self.assertEqual(notice.holder, heap.handle(0))
+        self.assertEqual(notice.field_index, 0)
+        self.assertEqual(notice.former_target, target)
+        with self.assertRaises(StaleHandleError):
+            heap.payload(notice.former_target)
+        self.assertEqual(heap.take_weak_clear_notices(), ())
+
+    def test_notice_only_for_real_gc_transition_and_rearm_allows_again(self):
+        heap = Heap(24)
+        holder = heap.allocate(1, n_weak=1)
+        first = heap.allocate(2)
+        heap.set_weak(holder, 0, first)
+        heap.add_root("holder", holder)
+
+        heap.collect()
+        first_notice = heap.take_weak_clear_notices()
+        self.assertEqual(len(first_notice), 1)
+
+        # The edge remains null. Explicit nulls and repeated null-edge GCs
+        # do not synthesize another notice.
+        fresh_holder = heap.handle(first_notice[0].holder.address)
+        heap.set_weak(fresh_holder, 0, None)
+        heap.collect()
+        self.assertEqual(heap.take_weak_clear_notices(), ())
+
+        # Re-pointing the same field arms it once more; only a later real
+        # GC clearing produces the next notice.
+        fresh_holder = heap.root_handle("holder")
+        second = heap.allocate(3)
+        heap.set_weak(fresh_holder, 0, second)
+        self.assertEqual(heap.take_weak_clear_notices(), ())
+        heap.collect()
+        notices = heap.take_weak_clear_notices()
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0].former_target, second)
+        self.assertEqual(notices[0].field_index, 0)
+
+    def test_surviving_target_and_explicit_clear_do_not_notify(self):
+        heap = Heap(20)
+        holder = heap.allocate(1, n_weak=2)
+        survivor = heap.allocate(2)
+        heap.set_weak(holder, 0, survivor)
+        transient = heap.allocate(3)
+        heap.set_weak(holder, 1, transient)
+        heap.set_weak(holder, 1, None)
+        heap.add_root("holder", holder)
+        heap.add_root("survivor", survivor)
+
+        heap.collect()
+        fresh_holder = heap.root_handle("holder")
+        fresh_survivor = heap.root_handle("survivor")
+        self.assertEqual(heap.get_weak(fresh_holder, 0), fresh_survivor)
+        self.assertEqual(heap.take_weak_clear_notices(), ())
+
+    def test_unclaimed_notice_is_not_a_root(self):
+        heap = Heap(20)
+        holder = heap.allocate(1, n_weak=1)
+        target = heap.allocate(2)
+        heap.set_weak(holder, 0, target)
+        heap.add_root("holder", holder)
+        heap.collect()
+        notice = heap.take_weak_clear_notices()[0]
+
+        heap.remove_root("holder")
+        heap.collect()
+
+        self.assertEqual(heap.objects(), ())
+        # The retained notice is historical metadata, not an updating root.
+        with self.assertRaises(StaleHandleError):
+            heap.payload(notice.holder)
 
 
 # --------------------------------------------------------------------------- #

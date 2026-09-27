@@ -76,6 +76,15 @@ def main() -> None:
     print(f"  live_slots:            {result.live_slots}")
     print(f"  roots preserved:       {result.roots_preserved}")
     print(f"  cleared weak edges:    {list(result.cleared_weak_edges)}")
+    notices = heap.take_weak_clear_notices()
+    print(f"  claimed notices:       {len(notices)}")
+    for notice in notices:
+        print(
+            "    weak edge "
+            f"holder@{notice.holder.address}[{notice.field_index}] "
+            f"was -> target@{notice.former_target.address}/"
+            f"epoch {notice.former_target.epoch}"
+        )
 
     h = heap.root_handle("main")
     strong_child = heap.get_strong(h, 0)
@@ -90,6 +99,11 @@ def main() -> None:
           f"same object as weak[1]: {weak_child == strong_child}")
     print(f"  weak[0] (was -> cache @ {before['cache']}) is now: {weak_cache} "
           f"[cleared because cache was weakly referenced only]")
+    if notices:
+        print(f"  notice identifies holder@{notices[0].holder.address}, field "
+              f"{notices[0].field_index}, former cache target "
+              f"{notices[0].former_target}; queue is now empty: "
+              f"{heap.take_weak_clear_notices() == ()}")
     print(f"  live object addresses in the compacted heap: {list(heap.objects())}")
 
     moved = h.address != before["holder"] and strong_child.address != before["child"]

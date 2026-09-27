@@ -16,6 +16,7 @@ from .core import (
     CollectionResult,
     Handle,
     Heap,
+    WeakClearNotice,
 )
 from .errors import GCError, HeapCapacityError, StaleHandleError
 
@@ -23,6 +24,7 @@ __all__ = [
     "Heap",
     "Handle",
     "CollectionResult",
+    "WeakClearNotice",
     "GCError",
     "StaleHandleError",
     "HeapCapacityError",
